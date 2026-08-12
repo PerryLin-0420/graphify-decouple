@@ -2218,6 +2218,120 @@ def dispatch_command(cmd: str) -> None:
         print(f"open with: xdg-open {out}  (or file://{out.resolve()})")
         sys.exit(0)
 
+    elif cmd == "decouple":
+        # Candidate Decoupled Architecture (#2 in the graphify-decouple fork):
+        # 0-LLM, deterministic Extract-Class suggestions for god nodes, reusing
+        # the god-node ranking (analyze.god_nodes), community detection
+        # (cluster.cluster), and community naming (an existing
+        # .graphify_labels.json pass, or label_communities_by_hub as the
+        # deterministic fallback) graphify already computes. See decouple.py.
+        from graphify.affected import load_graph
+        from graphify.cluster import cluster as _cluster, label_communities_by_hub
+        from graphify.decouple import decouple_plan, render_markdown
+        from graphify.paths import write_json_atomic as _wja
+        graph_path = Path(_GRAPHIFY_OUT) / "graph.json"
+        output_dir: "Path | None" = None
+        top_n = 10
+        min_group_size = 3
+        net_benefit_threshold = 5.0
+        extracted_only = "--extracted-only" in sys.argv
+        as_json = "--json" in sys.argv
+        no_html = "--no-html" in sys.argv
+        args = sys.argv[2:]
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = Path(args[i + 1]); i += 2
+            elif a == "--top" and i + 1 < len(args):
+                try:
+                    top_n = int(args[i + 1])
+                except ValueError:
+                    print("error: --top must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                i += 2
+            elif a == "--min-group-size" and i + 1 < len(args):
+                try:
+                    min_group_size = int(args[i + 1])
+                except ValueError:
+                    print("error: --min-group-size must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                i += 2
+            elif a == "--net-benefit-threshold" and i + 1 < len(args):
+                try:
+                    net_benefit_threshold = float(args[i + 1])
+                except ValueError:
+                    print("error: --net-benefit-threshold must be a number", file=sys.stderr)
+                    sys.exit(1)
+                i += 2
+            elif a == "--output-dir" and i + 1 < len(args):
+                output_dir = Path(args[i + 1]); i += 2
+            elif a in ("-h", "--help"):
+                print("Usage: graphify decouple [--graph PATH] [--top N] [--min-group-size N]")
+                print("  --graph PATH            path to graph.json (default graphify-out/graph.json)")
+                print("  --top N                 how many god nodes to analyze (default 10)")
+                print("  --min-group-size N      minimum members to propose a split group (default 3)")
+                print("  --net-benefit-threshold N  risk_before - risk_after must exceed this to recommend a split (default 5.0)")
+                print("  --extracted-only        ignore INFERRED/AMBIGUOUS member edges")
+                print("  --output-dir DIR        output dir for DECOUPLE_PLAN.md/decouple.json/DECOUPLE.html (default: graph.json's directory)")
+                print("  --json                  print decouple.json to stdout instead of writing files")
+                print("  --no-html               skip DECOUPLE.html generation")
+                return
+            else:
+                i += 1
+        if not graph_path.is_file():
+            print(f"error: graph.json not found at {graph_path}", file=sys.stderr)
+            sys.exit(1)
+        _enforce_graph_size_cap_or_exit(graph_path)
+        try:
+            G = load_graph(graph_path)
+        except Exception as exc:
+            print(f"error: could not load graph: {exc}", file=sys.stderr)
+            sys.exit(1)
+        communities = _cluster(G)
+        community_labels: dict[int, str] = {}
+        labels_path = graph_path.parent / ".graphify_labels.json"
+        if labels_path.is_file():
+            try:
+                raw_labels = json.loads(labels_path.read_text(encoding="utf-8"))
+                community_labels = {int(k): v for k, v in raw_labels.items()}
+            except (json.JSONDecodeError, OSError, ValueError):
+                community_labels = {}
+        if not community_labels:
+            community_labels = label_communities_by_hub(G, communities)
+        plan = decouple_plan(
+            G, communities, community_labels,
+            top_n=top_n, min_group_size=min_group_size, extracted_only=extracted_only,
+            net_benefit_threshold=net_benefit_threshold,
+        )
+        if as_json:
+            print(json.dumps(plan, indent=2, ensure_ascii=False))
+            return
+        out_dir = output_dir or graph_path.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        md_path = out_dir / "DECOUPLE_PLAN.md"
+        json_path = out_dir / "decouple.json"
+        md_path.write_text(render_markdown(plan), encoding="utf-8")
+        _wja(json_path, plan, indent=2, ensure_ascii=False)
+        print(f"wrote {md_path}")
+        print(f"wrote {json_path}")
+        if not no_html:
+            from graphify.decouple_html import write_decouple_html
+            html_path = out_dir / "DECOUPLE.html"
+            write_decouple_html(plan, html_path)
+            print(f"wrote {html_path}")
+        god_entries = [e for e in plan["god_nodes"] if e["classification"] == "god_object"]
+        n_hub = sum(1 for e in plan["god_nodes"] if e["classification"] == "over_referenced_hub")
+        n_cohesive = len(plan["god_nodes"]) - len(god_entries) - n_hub
+        n_split = sum(1 for e in god_entries if e.get("risk", {}).get("recommendation") == "split")
+        n_marginal = sum(1 for e in god_entries if e.get("risk", {}).get("recommendation") == "marginal")
+        n_keep = len(god_entries) - n_split - n_marginal
+        print(
+            f"analyzed {len(plan['god_nodes'])} god nodes: {len(god_entries)} god-object candidates "
+            f"({n_split} worth splitting, {n_marginal} marginal, {n_keep} would introduce more coupling "
+            f"than it removes), {n_hub} over-referenced hubs, {n_cohesive} cohesive-but-large"
+        )
+
     elif cmd == "merge-driver":
         # git merge driver for graph.json — takes (base, current, other) and writes
         # the union of current+other nodes/edges back to current. Exits 1 on
