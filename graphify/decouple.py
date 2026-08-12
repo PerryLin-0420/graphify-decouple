@@ -420,6 +420,70 @@ def decouple_plan(
     }
 
 
+def build_augmented_graph(
+    G: nx.DiGraph,
+    plan: dict[str, Any],
+    communities: dict[int, list[str]],
+) -> tuple[nx.Graph, dict[int, list[str]]]:
+    """Overlay a decouple_plan()'s proposed groups onto a COPY of G as extra
+    nodes/edges, tagged `kind="proposed"` / `kind="proposed_edge"`.
+
+    The point of tagging rather than building a separate diagram: this graph
+    is handed straight to `graphify.exporters.html.to_html()`, the SAME
+    renderer that draws graph.html — identical physics, community colors,
+    search, legend, info panel. `exporters.html.to_html` reads the `kind` tag
+    to draw a proposed node as a dashed diamond (ringed green/amber/red by
+    its recommendation) instead of inventing a second visual language.
+
+    Each proposed node is placed in its TARGET community (the group's own
+    `community_id`), not the god node's community — so hiding that
+    community's legend entry hides the proposed extraction along with the
+    real members it would be made of. Residual groups (`community_id is
+    None`) are never drawn — they stay on the original class, not a split.
+    """
+    G2 = G.copy()
+    communities2 = {cid: list(members) for cid, members in communities.items()}
+    counter = 0
+    for entry in plan.get("god_nodes", []):
+        if entry.get("classification") != "god_object":
+            continue
+        risk = entry.get("risk", {})
+        recommendation = risk.get("recommendation", "split")
+        god_id = entry["id"]
+        for g in entry.get("proposed_groups", []):
+            cid = g.get("community_id")
+            if cid is None:
+                continue
+            node_id = f"_proposed_{god_id}_{counter}"
+            counter += 1
+            G2.add_node(
+                node_id,
+                label=g["name"],
+                file_type="concept",
+                source_file="",
+                kind="proposed",
+                decouple_recommendation=recommendation,
+                decouple_risk={
+                    "risk_before": risk.get("risk_before"),
+                    "risk_after": risk.get("risk_after"),
+                    "net_benefit": risk.get("net_benefit"),
+                    "recommendation": recommendation,
+                },
+                member_count=len(g["members"]),
+                cohesion_confidence=g.get("cohesion_confidence"),
+            )
+            G2.add_edge(
+                god_id, node_id,
+                relation="extract",
+                confidence="EXTRACTED",
+                kind="proposed_edge",
+                decouple_recommendation=recommendation,
+                _src=god_id, _tgt=node_id,
+            )
+            communities2.setdefault(cid, []).append(node_id)
+    return G2, communities2
+
+
 def render_markdown(plan: dict[str, Any]) -> str:
     p = plan["params"]
     lines = [

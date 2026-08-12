@@ -19,6 +19,7 @@ from networkx.readwrite import json_graph
 import graphify.__main__ as mainmod
 from graphify.decouple import (
     balance_risk,
+    build_augmented_graph,
     candidate_groups,
     classify_god_node,
     decouple_plan,
@@ -28,6 +29,7 @@ from graphify.decouple import (
     render_markdown,
     split_risk_score,
 )
+from graphify.decouple_html import write_decouple_html
 
 
 def _add_member(g, god_id, member_id, *, label, source_file, relation="method", confidence="EXTRACTED"):
@@ -286,6 +288,54 @@ def test_decouple_plan_end_to_end():
     assert "proposed_groups" in by_id["god"]
     md = render_markdown(plan)
     assert "GodClass" in md and "HubClass" in md and "Honesty notes" in md
+
+
+# ── build_augmented_graph / write_decouple_html (same style as graph.html) ──
+
+def test_build_augmented_graph_adds_proposed_nodes_for_recommended_splits():
+    g = _build_graph()
+    communities = _communities_for(g)
+    plan = decouple_plan(g, communities, {0: "First Half", 1: "Second Half"}, top_n=20, min_group_size=3)
+    g2, communities2 = build_augmented_graph(g, plan, communities)
+
+    proposed = [n for n, d in g2.nodes(data=True) if d.get("kind") == "proposed"]
+    # "god" -> 2 real groups; "tangled" is still god_object (2 groups) even
+    # though discouraged — a discouraged candidate is still drawn (just
+    # ringed differently), so both god nodes contribute proposed nodes.
+    assert len(proposed) == 4
+    for pid in proposed:
+        assert g2.nodes[pid]["decouple_recommendation"] in ("split", "marginal", "keep_as_is")
+    # every proposed node landed in ITS target community, not the god node's own
+    god_data = g2.nodes["god"]
+    assert "kind" not in god_data  # the real node is untouched
+    for cid, members in communities2.items():
+        for m in members:
+            if m in proposed:
+                assert g2.nodes[m]["kind"] == "proposed"
+
+
+def test_build_augmented_graph_skips_residual_and_non_god_object():
+    g = _build_graph()
+    communities = _communities_for(g)
+    plan = decouple_plan(g, communities, top_n=20, min_group_size=3)
+    g2, _ = build_augmented_graph(g, plan, communities)
+    # "hub" (over_referenced_hub) and "big" (cohesive_but_large) never get a
+    # proposed node hanging off them.
+    assert not any(g2.has_edge("hub", n) and g2.nodes[n].get("kind") == "proposed" for n in g2.nodes)
+    assert not any(g2.has_edge("big", n) and g2.nodes[n].get("kind") == "proposed" for n in g2.nodes)
+
+
+def test_write_decouple_html_reuses_visjs_style(tmp_path):
+    g = _build_graph()
+    communities = _communities_for(g)
+    plan = decouple_plan(g, communities, {0: "First Half", 1: "Second Half"}, top_n=20, min_group_size=3)
+    out = tmp_path / "DECOUPLE.html"
+    write_decouple_html(g, plan, communities, {0: "First Half", 1: "Second Half"}, out)
+    html = out.read_text(encoding="utf-8")
+    assert "vis-network" in html  # same renderer as graph.html, not a separate diagram
+    assert "mermaid" not in html.lower()
+    assert "Show risk scores" in html  # toggle present because a proposed node exists
+    assert '"shape":"diamond"' in html or '"shape": "diamond"' in html
 
 
 # ── CLI end-to-end (smoke) ────────────────────────────────────────────────────

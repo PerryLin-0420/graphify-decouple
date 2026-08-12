@@ -2318,7 +2318,7 @@ def dispatch_command(cmd: str) -> None:
         if not no_html:
             from graphify.decouple_html import write_decouple_html
             html_path = out_dir / "DECOUPLE.html"
-            write_decouple_html(plan, html_path)
+            write_decouple_html(G, plan, communities, community_labels, html_path)
             print(f"wrote {html_path}")
         god_entries = [e for e in plan["god_nodes"] if e["classification"] == "god_object"]
         n_hub = sum(1 for e in plan["god_nodes"] if e["classification"] == "over_referenced_hub")

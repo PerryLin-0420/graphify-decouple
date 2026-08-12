@@ -121,12 +121,25 @@ function esc(s) {{
 }}
 
 // Build vis datasets
-const nodesDS = new vis.DataSet(RAW_NODES.map(n => ({{
-  id: n.id, label: n.label, color: n.color, size: n.size,
-  font: n.font, title: n.title,
-  _community: n.community, _community_name: n.community_name,
-  _source_file: n.source_file, _file_type: n.file_type, _degree: n.degree,
-}})));
+const nodesDS = new vis.DataSet(RAW_NODES.map(n => {{
+  const base = {{
+    id: n.id, label: n.label, color: n.color, size: n.size,
+    font: n.font, title: n.title,
+    _community: n.community, _community_name: n.community_name,
+    _source_file: n.source_file, _file_type: n.file_type, _degree: n.degree,
+    _kind: n.kind || 'real', _risk: n.risk || null,
+    _label_plain: n.label, _label_scored: n.label_scored || n.label,
+  }};
+  // Conditional keys only — an explicit `undefined` on a vis.DataSet item can
+  // still override the network-wide default (e.g. shape: 'dot'), so these are
+  // omitted entirely for a node that doesn't set them, rather than forwarded
+  // as undefined (this also fixes the pre-existing gap where a learning-
+  // overlay ring's borderWidth/shapeProperties never reached vis at all).
+  if (n.shape) base.shape = n.shape;
+  if (n.borderWidth) base.borderWidth = n.borderWidth;
+  if (n.shapeProperties) base.shapeProperties = n.shapeProperties;
+  return base;
+}}));
 
 const edgesDS = new vis.DataSet(RAW_EDGES.map((e, i) => ({{
   id: i, from: e.from, to: e.to,
@@ -178,13 +191,26 @@ function showInfo(nodeId) {{
     return `<span class="neighbor-link" style="border-left-color:${{esc(color)}}" data-nid="${{esc(nid)}}">${{esc(nb ? nb.label : nid)}}</span>`;
   }}).join('');
   document.getElementById('info-content').innerHTML = `
-    <div class="field"><b>${{esc(n.label)}}</b></div>
+    <div class="field"><b>${{esc(n._label_plain)}}</b>${{n._kind === 'proposed' ? ' <span style="color:#a8a29e;font-size:11px">(proposed)</span>' : ''}}</div>
     <div class="field">Type: ${{esc(n._file_type || 'unknown')}}</div>
     <div class="field">Community: ${{esc(n._community_name)}}</div>
     <div class="field">Source: ${{esc(n._source_file || '-')}}</div>
     <div class="field">Degree: ${{n._degree}}</div>
+    ${{n._risk ? `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Decouple risk</div>
+    <div class="field">Recommendation: <b>${{esc(n._risk.recommendation)}}</b></div>
+    <div class="field">risk_before &rarr; risk_after: ${{n._risk.risk_before}} &rarr; ${{n._risk.risk_after}} (net ${{n._risk.net_benefit}})</div>` : ''}}
     ${{neighborIds.length ? `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Neighbors (${{neighborIds.length}})</div><div id="neighbors-list">${{neighborItems}}</div>` : ''}}
   `;
+}}
+
+// Toggle: swap every node's displayed label between its plain name and a
+// name+score variant. Only nodes carrying a `_label_scored` different from
+// their plain label are touched — a no-op when nothing was proposed.
+function setScoreMode(showScores) {{
+  const updates = RAW_NODES
+    .filter(n => n.label_scored && n.label_scored !== n.label)
+    .map(n => ({{ id: n.id, label: showScores ? n.label_scored : n.label }}));
+  if (updates.length) nodesDS.update(updates);
 }}
 
 function focusNode(nodeId) {{
@@ -421,6 +447,11 @@ def to_html(
     # Status -> ring color. preferred=green, contested=amber. Tentative gets no
     # ring (it's not yet trustworthy enough to highlight in the map).
     _RING = {"preferred": "#22c55e", "contested": "#f59e0b"}
+    # decouple_recommendation -> ring color for a `kind="proposed"` node
+    # (see graphify.decouple.build_augmented_graph): green = worth extracting,
+    # amber = marginal, red = would introduce more coupling than it removes.
+    _DECOUPLE_RING = {"split": "#22c55e", "marginal": "#f59e0b", "keep_as_is": "#f87171"}
+    has_proposed = any(data.get("kind") == "proposed" for _, data in G.nodes(data=True))
 
     # Build nodes list for vis.js
     vis_nodes = []
@@ -480,6 +511,35 @@ def to_html(
             if stale:
                 lesson += " [code changed — re-verify]"
             node["title"] = _html.escape(label) + "\n" + _html.escape(sanitize_label(lesson))
+        # A `kind="proposed"` node (graphify decouple's overlay, #2 in the
+        # graphify-decouple fork) is not something the extraction found — it is
+        # a hypothetical class the plan suggests. Same renderer, same physics,
+        # same community-color background (so it visually stays with the
+        # members it would be extracted from) — but a diamond shape and a
+        # recommendation-colored dashed ring mark it as a proposal, never
+        # confusable with a real EXTRACTED node.
+        if data.get("kind") == "proposed":
+            node["kind"] = "proposed"
+            node["shape"] = "diamond"
+            node["borderWidth"] = 3
+            node["shapeProperties"] = {"borderDashes": [4, 3]}
+            recommendation = data.get("decouple_recommendation")
+            ring = _DECOUPLE_RING.get(recommendation, "#a8a29e")
+            node["color"] = {
+                "background": color, "border": ring,
+                "highlight": {"background": "#ffffff", "border": ring},
+            }
+            member_count = data.get("member_count") or 0
+            node["size"] = round(10 + 30 * min(member_count / 20, 1.0), 1)
+            node["font"] = {"size": 12, "color": "#ffffff"}
+            risk = data.get("decouple_risk")
+            if risk:
+                node["risk"] = risk
+                node["label_scored"] = f"{label} ({risk.get('risk_before')}→{risk.get('risk_after')})"
+                node["title"] = _html.escape(
+                    f"{label} — proposed ({recommendation}, "
+                    f"risk {risk.get('risk_before')}→{risk.get('risk_after')})"
+                )
         vis_nodes.append(node)
 
     # Build edges list. Restore original edge direction from _src/_tgt
@@ -488,6 +548,24 @@ def to_html(
     # for `calls` and `rationale_for` in the rendered graph (#563).
     vis_edges = []
     for u, v, data in G.edges(data=True):
+        if data.get("kind") == "proposed_edge":
+            # god node -> proposed group. Colored by the same recommendation
+            # ring as the group node itself, so the edge and the diamond it
+            # points at read as one unit regardless of confidence styling.
+            # _src/_tgt (not u/v) for the same reason as the generic path
+            # below: an undirected graph canonicalizes edge endpoint order.
+            recommendation = data.get("decouple_recommendation")
+            color_hex = _DECOUPLE_RING.get(recommendation, "#a8a29e")
+            vis_edges.append({
+                "from": data.get("_src", u),
+                "to": data.get("_tgt", v),
+                "label": "extract" if recommendation == "split" else "not worth it",
+                "title": _html.escape(f"decouple: {recommendation}"),
+                "dashes": True,
+                "width": 2,
+                "color": {"color": color_hex, "opacity": 0.85},
+            })
+            continue
         confidence = data.get("confidence", "EXTRACTED")
         relation = data.get("relation", "")
         true_src = data.get("_src", u)
@@ -521,6 +599,15 @@ def to_html(
     hyperedges_json = _js_safe(getattr(G, "graph", {}).get("hyperedges", []))
     title = _html.escape(sanitize_label(str(output_path)))
     stats = f"{G.number_of_nodes()} nodes &middot; {G.number_of_edges()} edges &middot; {len(communities)} communities"
+    # Only rendered when the graph carries at least one proposed (decouple)
+    # node — a plain graph.html with nothing proposed stays functionally
+    # unchanged (no dead checkbox for a toggle with nothing to do).
+    score_toggle_html = (
+        '<label><input type="checkbox" id="score-toggle-cb" '
+        'onchange="setScoreMode(this.checked)">Show risk scores '
+        '<span style="color:#666">(◆ proposed)</span></label>'
+        if has_proposed else ""
+    )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -547,6 +634,7 @@ def to_html(
     <h3>Communities</h3>
     <div id="legend-controls">
       <label><input type="checkbox" id="select-all-cb" checked onchange="toggleAllCommunities(!this.checked)">Select All</label>
+      {score_toggle_html}
     </div>
     <div id="legend"></div>
   </div>
