@@ -571,6 +571,8 @@ def _run_cli() -> None:
         print("    --min-group-size N      minimum members to propose a split group (default 3)")
         print("    --net-benefit-threshold N  risk_before - risk_after must exceed this to recommend a split (default 5.0)")
         print("    --extracted-only        ignore INFERRED/AMBIGUOUS member edges")
+        print("    --project-root <dir>    resolve source files against this root for the self/this-attribute overlap check")
+        print("    --no-state-check        skip the state-sharing check (call-graph-only scoring)")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
         print("    --output-dir <dir>      output dir for DECOUPLE_PLAN.md/decouple.json/DECOUPLE.html")
         print("    --json                  print decouple.json to stdout instead of writing files")

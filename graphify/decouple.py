@@ -16,9 +16,27 @@ coupling — interface segregation is the applicable move instead). See
 Honest limits (surfaced in every report, not just here):
   - Member detection uses AST relation edges only (method/contains/defines).
     Instance fields are not represented as graph nodes for most languages, so
-    this is a coupling proxy, not a true LCOM/attribute-usage measurement.
+    this is a coupling proxy, not a true LCOM/attribute-usage measurement —
+    UNLESS `project_root` is given to `decouple_plan`, in which case
+    `state_affinity` re-parses the god node's own source file to measure
+    real self/this-attribute overlap between proposed groups (see below).
   - `source_location` has no end line, so group sizes are counted in symbols,
     not lines of code.
+
+A call-graph-only split can look clean while still being cosmetic: two
+method groups can have zero cross-group CALLS and still share a pile of the
+same `self.` instance state — split them and both new classes need that
+state anyway (a back-reference, a shared context object, or duplicated
+fields), so coupling didn't go away, it relocated. When `project_root` is
+supplied, `graphify.state_affinity` re-parses the god node's source file
+(11 languages, tree-sitter — see that module for exact coverage; C is
+explicitly unsupported) to measure how much instance state each proposed
+group's methods actually touch, and folds the worst pairwise overlap into
+`split_risk_score` as a first-class cost — heavier than the call-graph
+terms, because it is closer to the actual failure mode. Without
+`project_root` this signal is skipped (not assumed clean), and every
+skipped entry says so explicitly rather than silently scoring as if it
+had been checked.
 """
 from __future__ import annotations
 
@@ -225,6 +243,7 @@ _RISK_COUPLING_CAP = 100       # afferent+efferent >= this maxes the "coupling" 
 _RISK_FRAGMENTATION_CAP = 5    # distinct_member_communities >= this maxes "fragmentation"
 _SPLIT_EDGE_CAP = 10           # new cross-group edges >= this maxes the "new coupling" component
 _SPLIT_GROUP_CAP = 5           # new classes - 1 >= this maxes the "group overhead" component
+_STATE_OVERLAP_ADD_WEIGHT = 0.6  # extra risk points ADDED (not blended) at 100% state overlap
 
 
 def original_risk_score(entry: dict[str, Any]) -> float:
@@ -240,7 +259,48 @@ def original_risk_score(entry: dict[str, Any]) -> float:
     return round(100 * (0.40 * size + 0.35 * coupling + 0.25 * fragmentation), 1)
 
 
-def split_risk_score(G: nx.DiGraph, god_id: str, groups: list[dict[str, Any]]) -> dict[str, Any]:
+def _group_state_overlap(
+    source_file: "str | None",
+    class_label: str,
+    non_residual_groups: list[dict[str, Any]],
+) -> "dict[str, Any] | None":
+    """Worst-case (max) pairwise self/this-attribute overlap between the
+    proposed groups, via `graphify.state_affinity`. None on any skip
+    (unsupported language, unreadable file, nothing found) — a skip, not a
+    zero; callers must not treat None as "verified clean"."""
+    if not source_file or len(non_residual_groups) < 2:
+        return None
+    import itertools
+
+    from graphify.state_affinity import extract_method_attribute_usage
+    from graphify.state_affinity import state_overlap as _pair_overlap
+
+    all_labels = [lbl for g in non_residual_groups for lbl in g.get("member_labels", [])]
+    usage = extract_method_attribute_usage(source_file, class_label, all_labels)
+    if not usage:
+        return None
+    pairs: list[dict[str, Any]] = []
+    for ga, gb in itertools.combinations(non_residual_groups, 2):
+        ov = _pair_overlap(usage, ga.get("member_labels", []), gb.get("member_labels", []))
+        if ov is None:
+            continue
+        pairs.append({
+            "group_a": ga["name"], "group_b": gb["name"],
+            "overlap": ov["overlap"], "shared_attrs": ov["shared_attrs"],
+        })
+    if not pairs:
+        return None
+    pairs.sort(key=lambda p: -p["overlap"])
+    return {"max_overlap": pairs[0]["overlap"], "pairs": pairs}
+
+
+def split_risk_score(
+    G: nx.DiGraph,
+    god_id: str,
+    groups: list[dict[str, Any]],
+    *,
+    state_overlap: "dict[str, Any] | None" = None,
+) -> dict[str, Any]:
     """0-100 proxy for the risk the SPLIT ITSELF introduces — complexity that
     does not exist today and only appears because of the split:
 
@@ -250,6 +310,13 @@ def split_risk_score(G: nx.DiGraph, god_id: str, groups: list[dict[str, Any]]) -
     - `straddling_callers`: outside nodes that depend on members from more
       than one proposed group. Today they hold one reference (the original
       class); after extraction they must depend on multiple new classes.
+    - `max_state_overlap` (only when `state_overlap` is supplied — see
+      `_group_state_overlap` / `graphify.state_affinity`): the worst-case
+      share of `self`/`this` state two proposed groups have in common. This
+      gets MORE weight than the call-graph terms above: two groups can have
+      zero cross-group calls and still both need the same instance state,
+      which the call graph cannot see at all — that is the "moved the
+      methods, didn't reduce the coupling" failure mode.
 
     A single non-residual group (nothing left to compare against) has no
     split risk by construction — there is no second class to be coupled to.
@@ -261,6 +328,9 @@ def split_risk_score(G: nx.DiGraph, god_id: str, groups: list[dict[str, Any]]) -
             "cross_group_edges": 0,
             "straddling_callers": 0,
             "straddling_caller_labels": [],
+            "state_analysis": "n/a (nothing to compare)",
+            "max_state_overlap": None,
+            "state_overlap_pairs": [],
             "score": 0.0,
         }
 
@@ -288,13 +358,34 @@ def split_risk_score(G: nx.DiGraph, god_id: str, groups: list[dict[str, Any]]) -
     edge_component = min(cross_group_edges / _SPLIT_EDGE_CAP, 1.0)
     straddle_component = min(len(straddlers) / total_callers, 1.0)
     group_overhead = min((len(non_residual) - 1) / _SPLIT_GROUP_CAP, 1.0)
-    score = round(100 * (0.45 * edge_component + 0.40 * straddle_component + 0.15 * group_overhead), 1)
+
+    # Same call-graph weights regardless of whether the state check ran —
+    # keeps the two signals independent instead of one diluting the other.
+    call_graph_score = 100 * (0.45 * edge_component + 0.40 * straddle_component + 0.15 * group_overhead)
+
+    if state_overlap is not None:
+        state_component = state_overlap.get("max_overlap") or 0.0
+        # ADDITIVE, not blended into the weighted average above: state
+        # coupling and call-graph coupling are two INDEPENDENT reasons a
+        # split can fail, and either one is bad news on its own. Averaging
+        # them let a call-graph score that was already high (near its cap)
+        # get pulled DOWN by a merely-moderate state overlap — the opposite
+        # of what a second bad signal should do. Adding it on top (capped at
+        # 100) means the state check can only reveal MORE risk, never less.
+        score = round(min(100.0, call_graph_score + _STATE_OVERLAP_ADD_WEIGHT * 100 * state_component), 1)
+        state_analysis = "ok"
+    else:
+        score = round(call_graph_score, 1)
+        state_analysis = "skipped (no project_root given, unsupported language, or source unreadable)"
 
     return {
         "n_new_classes": len(non_residual),
         "cross_group_edges": cross_group_edges,
         "straddling_callers": len(straddlers),
         "straddling_caller_labels": [G.nodes[c].get("label", c) for c in straddlers[:8]],
+        "state_analysis": state_analysis,
+        "max_state_overlap": state_overlap.get("max_overlap") if state_overlap else None,
+        "state_overlap_pairs": state_overlap.get("pairs", []) if state_overlap else [],
         "score": score,
     }
 
@@ -351,6 +442,7 @@ def decouple_plan(
     member_ratio_threshold: float = 0.2,
     min_communities_for_split: int = 2,
     net_benefit_threshold: float = 5.0,
+    project_root: "str | None" = None,
 ) -> dict[str, Any]:
     """Build a Candidate Decoupled Architecture plan for the top-N god nodes.
 
@@ -362,6 +454,13 @@ def decouple_plan(
     the split is actually worth recommending. The final diagram
     (decouple_html) only draws a group as a recommended extraction when that
     balance says so.
+
+    `project_root`, when given, lets `split_risk_score` fold in
+    `graphify.state_affinity`'s self/this-attribute overlap between proposed
+    groups (re-parses the god node's own `source_file`, resolved as
+    `project_root / source_file`). Omit it and the call-graph-only score is
+    used, honestly marked `state_analysis: "skipped"` rather than looking
+    equally confident as a verified one.
     """
     from graphify.analyze import god_nodes as _god_nodes
 
@@ -382,7 +481,13 @@ def decouple_plan(
             )
             info["proposed_groups"] = groups
             risk_before = original_risk_score(info)
-            split = split_risk_score(G, node_id, groups)
+            non_residual = [gr for gr in groups if gr["community_id"] is not None]
+            abs_source = None
+            if project_root and info.get("source_file"):
+                from pathlib import Path as _Path
+                abs_source = str(_Path(project_root) / info["source_file"])
+            overlap = _group_state_overlap(abs_source, info["label"], non_residual)
+            split = split_risk_score(G, node_id, groups, state_overlap=overlap)
             info["risk"] = balance_risk(risk_before, split, net_benefit_threshold=net_benefit_threshold)
         elif info["classification"] == "over_referenced_hub":
             info["hub_suggestion"] = hub_suggestion(G, node_id)
@@ -396,12 +501,17 @@ def decouple_plan(
             "member_ratio_threshold": member_ratio_threshold,
             "min_communities_for_split": min_communities_for_split,
             "net_benefit_threshold": net_benefit_threshold,
+            "project_root": project_root,
         },
         "god_nodes": entries,
         "caveats": [
             "Member detection uses AST relation edges only (method/contains/defines); "
             "instance fields are not graph nodes for most languages, so this is a "
-            "coupling proxy, not a true LCOM/attribute-usage measurement.",
+            "coupling proxy, not a true LCOM/attribute-usage measurement, EXCEPT where "
+            "state_analysis == 'ok' (project_root was given and the language is "
+            "supported) — there, max_state_overlap comes from re-parsing the actual "
+            "source for self/this-attribute usage. See graphify.state_affinity for "
+            "exact language coverage (C is explicitly unsupported).",
             "source_location has no end line, so group sizes are counted in symbols, "
             "not lines of code.",
             "A same-source_file ownership guard excludes 'method' edges that symbol "
@@ -416,6 +526,10 @@ def decouple_plan(
             "recommendation is decided at whole-god-node granularity (extract ALL "
             "proposed groups, or none) — it does not search partial/alternative "
             "groupings for a better balance.",
+            "state_analysis == 'skipped' means max_state_overlap was NOT checked for "
+            "that entry (no project_root given, unsupported language, or the source "
+            "file could not be read/parsed) — it is an unknown, not a verified zero. "
+            "Its recommendation rests on the call-graph terms alone.",
         ],
     }
 
@@ -592,6 +706,17 @@ def render_markdown(plan: dict[str, Any]) -> str:
                     f"{sd['cross_group_edges']} cross-group edges introduced; "
                     f"{sd['straddling_callers']} caller(s) would depend on more than one new class"
                 )
+                if sd.get("state_analysis") == "ok":
+                    lines.append(f"  - max shared instance-state overlap between two proposed groups: {sd['max_state_overlap']}")
+                    for pair in sd.get("state_overlap_pairs", [])[:5]:
+                        if pair["overlap"] <= 0:
+                            continue
+                        lines.append(
+                            f"    - `{pair['group_a']}` <-> `{pair['group_b']}`: "
+                            f"overlap={pair['overlap']}, shared: {', '.join(pair['shared_attrs'][:8])}"
+                        )
+                else:
+                    lines.append(f"  - state-sharing check: {sd.get('state_analysis', 'skipped')}")
             for g in entry.get("proposed_groups", []):
                 conf = g.get("cohesion_confidence", "n/a")
                 lines.append("")

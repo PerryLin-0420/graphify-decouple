@@ -265,6 +265,56 @@ def test_original_risk_score_increases_with_size_and_coupling():
     assert original_risk_score(large) > original_risk_score(small)
 
 
+# ── state_affinity integration: a call-graph-clean split that shares state ──
+
+def test_decouple_plan_state_overlap_discourages_a_call_graph_clean_split(tmp_path):
+    """Two proposed groups with ZERO cross-group edges and ZERO straddling
+    callers (the call graph looks perfectly clean) but whose real methods
+    all read the SAME instance attribute — the exact "moved the methods,
+    didn't reduce the coupling" failure mode a call-graph-only score cannot
+    see. project_root=None must not detect this; project_root=tmp_path must.
+    """
+    g = nx.DiGraph()
+    g.add_node("stategod", label="StateGod", file_type="code", source_file="stategod.py", source_location="L1")
+    for i in range(3):
+        _add_member(g, "stategod", f"sa{i}", label=f".sa{i}()", source_file="stategod.py")
+    for i in range(3):
+        _add_member(g, "stategod", f"sb{i}", label=f".sb{i}()", source_file="stategod.py")
+    for i in range(2):
+        g.add_node(f"scaller{i}", label=f"scaller{i}()", file_type="code", source_file="caller.py", source_location="L1")
+        g.add_edge(f"scaller{i}", "stategod", relation="calls", confidence="EXTRACTED")
+
+    communities = {20: ["sa0", "sa1", "sa2"], 21: ["sb0", "sb1", "sb2"]}
+    labels = {20: "Group SA", 21: "Group SB"}
+
+    src = (
+        "class StateGod:\n"
+        "    def sa0(self):\n        return self._shared\n"
+        "    def sa1(self):\n        return self._shared\n"
+        "    def sa2(self):\n        return self._shared\n"
+        "    def sb0(self):\n        return self._shared\n"
+        "    def sb1(self):\n        return self._shared\n"
+        "    def sb2(self):\n        return self._shared\n"
+    )
+    (tmp_path / "stategod.py").write_text(src, encoding="utf-8")
+
+    plan_without = decouple_plan(g, communities, labels, top_n=20, min_group_size=3)
+    plan_with = decouple_plan(g, communities, labels, top_n=20, min_group_size=3, project_root=str(tmp_path))
+
+    without = next(e for e in plan_without["god_nodes"] if e["id"] == "stategod")["risk"]
+    with_ = next(e for e in plan_with["god_nodes"] if e["id"] == "stategod")["risk"]
+
+    assert without["split_detail"]["cross_group_edges"] == 0
+    assert without["split_detail"]["straddling_callers"] == 0
+    assert without["split_detail"]["state_analysis"].startswith("skipped")
+    assert without["recommendation"] == "split"  # call-graph-only sees nothing wrong
+
+    assert with_["split_detail"]["state_analysis"] == "ok"
+    assert with_["split_detail"]["max_state_overlap"] == 1.0  # both groups touch ONLY _shared
+    assert with_["risk_after"] > without["risk_after"]
+    assert with_["net_benefit"] < without["net_benefit"]
+
+
 # ── hub_suggestion ───────────────────────────────────────────────────────────
 
 def test_hub_suggestion_lists_dependents():

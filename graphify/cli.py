@@ -2231,18 +2231,22 @@ def dispatch_command(cmd: str) -> None:
         from graphify.paths import write_json_atomic as _wja
         graph_path = Path(_GRAPHIFY_OUT) / "graph.json"
         output_dir: "Path | None" = None
+        project_root: "Path | None" = None
         top_n = 10
         min_group_size = 3
         net_benefit_threshold = 5.0
         extracted_only = "--extracted-only" in sys.argv
         as_json = "--json" in sys.argv
         no_html = "--no-html" in sys.argv
+        no_state_check = "--no-state-check" in sys.argv
         args = sys.argv[2:]
         i = 0
         while i < len(args):
             a = args[i]
             if a == "--graph" and i + 1 < len(args):
                 graph_path = Path(args[i + 1]); i += 2
+            elif a == "--project-root" and i + 1 < len(args):
+                project_root = Path(args[i + 1]); i += 2
             elif a == "--top" and i + 1 < len(args):
                 try:
                     top_n = int(args[i + 1])
@@ -2273,6 +2277,8 @@ def dispatch_command(cmd: str) -> None:
                 print("  --min-group-size N      minimum members to propose a split group (default 3)")
                 print("  --net-benefit-threshold N  risk_before - risk_after must exceed this to recommend a split (default 5.0)")
                 print("  --extracted-only        ignore INFERRED/AMBIGUOUS member edges")
+                print("  --project-root DIR      resolve source_file against this root for the state-sharing check (default: .graphify_root sidecar, else --graph's grandparent dir)")
+                print("  --no-state-check        skip the self/this-attribute overlap check (call-graph-only scoring, same as before this signal existed)")
                 print("  --output-dir DIR        output dir for DECOUPLE_PLAN.md/decouple.json/DECOUPLE.html (default: graph.json's directory)")
                 print("  --json                  print decouple.json to stdout instead of writing files")
                 print("  --no-html               skip DECOUPLE.html generation")
@@ -2299,10 +2305,25 @@ def dispatch_command(cmd: str) -> None:
                 community_labels = {}
         if not community_labels:
             community_labels = label_communities_by_hub(G, communities)
+        resolved_root: "str | None" = None
+        if not no_state_check:
+            if project_root is not None:
+                resolved_root = str(project_root)
+            else:
+                root_sidecar = graph_path.parent / ".graphify_root"
+                if root_sidecar.is_file():
+                    try:
+                        resolved_root = root_sidecar.read_text(encoding="utf-8").strip() or None
+                    except OSError:
+                        resolved_root = None
+                if resolved_root is None:
+                    # Matches the default `<root>/graphify-out/graph.json` layout the
+                    # skill always builds — the same fallback `tree`'s --root uses.
+                    resolved_root = str(graph_path.parent.parent)
         plan = decouple_plan(
             G, communities, community_labels,
             top_n=top_n, min_group_size=min_group_size, extracted_only=extracted_only,
-            net_benefit_threshold=net_benefit_threshold,
+            net_benefit_threshold=net_benefit_threshold, project_root=resolved_root,
         )
         if as_json:
             print(json.dumps(plan, indent=2, ensure_ascii=False))
