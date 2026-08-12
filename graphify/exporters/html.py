@@ -447,10 +447,12 @@ def to_html(
     # Status -> ring color. preferred=green, contested=amber. Tentative gets no
     # ring (it's not yet trustworthy enough to highlight in the map).
     _RING = {"preferred": "#22c55e", "contested": "#f59e0b"}
-    # decouple_recommendation -> ring color for a `kind="proposed"` node
-    # (see graphify.decouple.build_augmented_graph): green = worth extracting,
-    # amber = marginal, red = would introduce more coupling than it removes.
-    _DECOUPLE_RING = {"split": "#22c55e", "marginal": "#f59e0b", "keep_as_is": "#f87171"}
+    # Ring color for a `kind="proposed"` node (see
+    # graphify.decouple.build_augmented_graph, which only ever overlays a
+    # `recommendation == "split"` group — a discouraged candidate is already
+    # fully expressed as a number in DECOUPLE_PLAN.md/decouple.json and is
+    # never drawn here, so there is only one color to pick).
+    _DECOUPLE_RING_COLOR = "#22c55e"
     has_proposed = any(data.get("kind") == "proposed" for _, data in G.nodes(data=True))
 
     # Build nodes list for vis.js
@@ -513,21 +515,20 @@ def to_html(
             node["title"] = _html.escape(label) + "\n" + _html.escape(sanitize_label(lesson))
         # A `kind="proposed"` node (graphify decouple's overlay, #2 in the
         # graphify-decouple fork) is not something the extraction found — it is
-        # a hypothetical class the plan suggests. Same renderer, same physics,
-        # same community-color background (so it visually stays with the
-        # members it would be extracted from) — but a diamond shape and a
-        # recommendation-colored dashed ring mark it as a proposal, never
-        # confusable with a real EXTRACTED node.
+        # a hypothetical class a RECOMMENDED split suggests (build_augmented_
+        # graph never draws a discouraged candidate). Same renderer, same
+        # physics, same community-color background (so it visually stays with
+        # the members it would be extracted from) — but a diamond shape and a
+        # dashed green ring mark it as a proposal, never confusable with a
+        # real EXTRACTED node.
         if data.get("kind") == "proposed":
             node["kind"] = "proposed"
             node["shape"] = "diamond"
             node["borderWidth"] = 3
             node["shapeProperties"] = {"borderDashes": [4, 3]}
-            recommendation = data.get("decouple_recommendation")
-            ring = _DECOUPLE_RING.get(recommendation, "#a8a29e")
             node["color"] = {
-                "background": color, "border": ring,
-                "highlight": {"background": "#ffffff", "border": ring},
+                "background": color, "border": _DECOUPLE_RING_COLOR,
+                "highlight": {"background": "#ffffff", "border": _DECOUPLE_RING_COLOR},
             }
             member_count = data.get("member_count") or 0
             node["size"] = round(10 + 30 * min(member_count / 20, 1.0), 1)
@@ -537,8 +538,8 @@ def to_html(
                 node["risk"] = risk
                 node["label_scored"] = f"{label} ({risk.get('risk_before')}→{risk.get('risk_after')})"
                 node["title"] = _html.escape(
-                    f"{label} — proposed ({recommendation}, "
-                    f"risk {risk.get('risk_before')}→{risk.get('risk_after')})"
+                    f"{label} — proposed extraction, "
+                    f"risk {risk.get('risk_before')}→{risk.get('risk_after')}"
                 )
         vis_nodes.append(node)
 
@@ -549,21 +550,20 @@ def to_html(
     vis_edges = []
     for u, v, data in G.edges(data=True):
         if data.get("kind") == "proposed_edge":
-            # god node -> proposed group. Colored by the same recommendation
-            # ring as the group node itself, so the edge and the diamond it
-            # points at read as one unit regardless of confidence styling.
-            # _src/_tgt (not u/v) for the same reason as the generic path
-            # below: an undirected graph canonicalizes edge endpoint order.
-            recommendation = data.get("decouple_recommendation")
-            color_hex = _DECOUPLE_RING.get(recommendation, "#a8a29e")
+            # god node -> proposed group, always a RECOMMENDED split (see
+            # build_augmented_graph) — colored to match the diamond it points
+            # at, so the edge and the node read as one unit regardless of
+            # confidence styling. _src/_tgt (not u/v) for the same reason as
+            # the generic path below: an undirected graph canonicalizes edge
+            # endpoint order.
             vis_edges.append({
                 "from": data.get("_src", u),
                 "to": data.get("_tgt", v),
-                "label": "extract" if recommendation == "split" else "not worth it",
-                "title": _html.escape(f"decouple: {recommendation}"),
+                "label": "extract",
+                "title": _html.escape("decouple: recommended split"),
                 "dashes": True,
                 "width": 2,
-                "color": {"color": color_hex, "opacity": 0.85},
+                "color": {"color": _DECOUPLE_RING_COLOR, "opacity": 0.85},
             })
             continue
         confidence = data.get("confidence", "EXTRACTED")

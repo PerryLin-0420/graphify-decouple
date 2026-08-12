@@ -299,12 +299,13 @@ def test_build_augmented_graph_adds_proposed_nodes_for_recommended_splits():
     g2, communities2 = build_augmented_graph(g, plan, communities)
 
     proposed = [n for n, d in g2.nodes(data=True) if d.get("kind") == "proposed"]
-    # "god" -> 2 real groups; "tangled" is still god_object (2 groups) even
-    # though discouraged — a discouraged candidate is still drawn (just
-    # ringed differently), so both god nodes contribute proposed nodes.
-    assert len(proposed) == 4
+    # "god" -> 2 real, RECOMMENDED groups. "tangled" is still classified
+    # god_object but its split is discouraged (see the dedicated test below)
+    # and must contribute nothing here — a discouraged candidate is a number
+    # in the report, not a shape on the graph.
+    assert len(proposed) == 2
     for pid in proposed:
-        assert g2.nodes[pid]["decouple_recommendation"] in ("split", "marginal", "keep_as_is")
+        assert g2.nodes[pid]["decouple_recommendation"] == "split"
     # every proposed node landed in ITS target community, not the god node's own
     god_data = g2.nodes["god"]
     assert "kind" not in god_data  # the real node is untouched
@@ -323,6 +324,21 @@ def test_build_augmented_graph_skips_residual_and_non_god_object():
     # proposed node hanging off them.
     assert not any(g2.has_edge("hub", n) and g2.nodes[n].get("kind") == "proposed" for n in g2.nodes)
     assert not any(g2.has_edge("big", n) and g2.nodes[n].get("kind") == "proposed" for n in g2.nodes)
+
+
+def test_build_augmented_graph_skips_discouraged_god_object():
+    """`tangled` is structurally god_object but its split is discouraged
+    (heavy cross-group coupling, see test_decouple_plan_discourages_tangled_
+    split) — build_augmented_graph must draw nothing for it at all, not even
+    ringed differently."""
+    g = _build_graph()
+    communities = _communities_for(g)
+    plan = decouple_plan(g, communities, top_n=20, min_group_size=3)
+    by_id = {e["id"]: e for e in plan["god_nodes"]}
+    assert by_id["tangled"]["risk"]["recommendation"] != "split"
+    g2, _ = build_augmented_graph(g, plan, communities)
+    assert not any(g2.has_edge("tangled", n) for n in g2.nodes if g2.nodes[n].get("kind") == "proposed")
+    assert not any(n.startswith("_proposed_tangled_") for n in g2.nodes)
 
 
 def test_write_decouple_html_reuses_visjs_style(tmp_path):

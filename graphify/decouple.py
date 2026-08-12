@@ -425,15 +425,22 @@ def build_augmented_graph(
     plan: dict[str, Any],
     communities: dict[int, list[str]],
 ) -> tuple[nx.Graph, dict[int, list[str]]]:
-    """Overlay a decouple_plan()'s proposed groups onto a COPY of G as extra
-    nodes/edges, tagged `kind="proposed"` / `kind="proposed_edge"`.
+    """Overlay a decouple_plan()'s RECOMMENDED splits onto a COPY of G as
+    extra nodes/edges, tagged `kind="proposed"` / `kind="proposed_edge"`.
+
+    Only `risk.recommendation == "split"` groups are drawn. A `marginal` or
+    `keep_as_is` candidate was already weighed by `balance_risk` and found
+    not worth it — the balanced verdict IS the number (risk_before vs
+    risk_after in DECOUPLE_PLAN.md / decouple.json), so there is nothing
+    useful added by also drawing it on the graph. Showing it there would
+    just be a shape asking to be second-guessed by eye.
 
     The point of tagging rather than building a separate diagram: this graph
     is handed straight to `graphify.exporters.html.to_html()`, the SAME
     renderer that draws graph.html — identical physics, community colors,
     search, legend, info panel. `exporters.html.to_html` reads the `kind` tag
-    to draw a proposed node as a dashed diamond (ringed green/amber/red by
-    its recommendation) instead of inventing a second visual language.
+    to draw a proposed node as a dashed diamond instead of inventing a
+    second visual language.
 
     Each proposed node is placed in its TARGET community (the group's own
     `community_id`), not the god node's community — so hiding that
@@ -449,6 +456,8 @@ def build_augmented_graph(
             continue
         risk = entry.get("risk", {})
         recommendation = risk.get("recommendation", "split")
+        if recommendation != "split":
+            continue
         god_id = entry["id"]
         for g in entry.get("proposed_groups", []):
             cid = g.get("community_id")
