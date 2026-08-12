@@ -57,7 +57,7 @@ def _html_styles() -> str:
   .legend-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .legend-count { color: #666; font-size: 11px; }
   #stats { padding: 10px 14px; border-top: 1px solid #2a2a4e; font-size: 11px; color: #555; }
-  #legend-controls { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; padding: 4px 0; }
+  #legend-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; margin-bottom: 8px; padding: 4px 0; }
   #legend-controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; color: #aaa; user-select: none; }
   #legend-controls label:hover { color: #e0e0e0; }
   .legend-cb, #select-all-cb { appearance: none; -webkit-appearance: none; width: 14px; height: 14px; border: 1.5px solid #3a3a5e; border-radius: 3px; background: #0f0f1a; cursor: pointer; position: relative; flex-shrink: 0; }
@@ -129,6 +129,7 @@ const nodesDS = new vis.DataSet(RAW_NODES.map(n => {{
     _source_file: n.source_file, _file_type: n.file_type, _degree: n.degree,
     _kind: n.kind || 'real', _risk: n.risk || null,
     _label_plain: n.label, _label_scored: n.label_scored || n.label,
+    _extracted_into: n.extracted_into || null,
   }};
   // Conditional keys only — an explicit `undefined` on a vis.DataSet item can
   // still override the network-wide default (e.g. shape: 'dot'), so these are
@@ -138,6 +139,7 @@ const nodesDS = new vis.DataSet(RAW_NODES.map(n => {{
   if (n.shape) base.shape = n.shape;
   if (n.borderWidth) base.borderWidth = n.borderWidth;
   if (n.shapeProperties) base.shapeProperties = n.shapeProperties;
+  if (n.hidden) base.hidden = true;
   return base;
 }}));
 
@@ -199,8 +201,23 @@ function showInfo(nodeId) {{
     ${{n._risk ? `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Decouple risk</div>
     <div class="field">Recommendation: <b>${{esc(n._risk.recommendation)}}</b></div>
     <div class="field">risk_before &rarr; risk_after: ${{n._risk.risk_before}} &rarr; ${{n._risk.risk_after}} (net ${{n._risk.net_benefit}})</div>` : ''}}
+    ${{n._extracted_into ? `<div class="field" style="margin-top:8px;color:#94a3b8;font-size:11px">Would move into: ${{esc((nodesDS.get(n._extracted_into) || {{}}).label || n._extracted_into)}}</div>` : ''}}
     ${{neighborIds.length ? `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Neighbors (${{neighborIds.length}})</div><div id="neighbors-list">${{neighborItems}}</div>` : ''}}
   `;
+}}
+
+// Toggle: hide every real node a recommended split would pull out and show
+// the diamonds (+ their redirected edges — hidden automatically once their
+// diamond endpoint is hidden, so nothing extra to manage there) in their
+// place. Off (default) = the graph exactly as extracted, unchanged. On =
+// a preview of the wiring AFTER the recommended splits.
+function setDecoupleView(showAfter) {{
+  const updates = [];
+  RAW_NODES.forEach(n => {{
+    if (n.kind === 'proposed') updates.push({{ id: n.id, hidden: !showAfter }});
+    else if (n.extracted_into) updates.push({{ id: n.id, hidden: showAfter }});
+  }});
+  if (updates.length) nodesDS.update(updates);
 }}
 
 // Toggle: swap every node's displayed label between its plain name and a
@@ -483,6 +500,13 @@ def to_html(
             "file_type": data.get("file_type", ""),
             "degree": deg,
         }
+        # A real node that a recommended split would pull out (see
+        # graphify.decouple.build_augmented_graph) — the "Preview decoupled
+        # view" toggle hides this node (and, being hidden, its edges) and
+        # shows the diamond it points to instead.
+        extracted_into = data.get("decouple_extracted_into")
+        if extracted_into:
+            node["extracted_into"] = extracted_into
         # Conditional learning fields — only present for annotated nodes, so
         # un-annotated output keeps the exact pre-feature node dict shape.
         entry = learning_overlay.get(str(node_id)) if learning_overlay else None
@@ -526,6 +550,8 @@ def to_html(
             node["shape"] = "diamond"
             node["borderWidth"] = 3
             node["shapeProperties"] = {"borderDashes": [4, 3]}
+            if data.get("hidden"):
+                node["hidden"] = True  # "before" is the default view
             node["color"] = {
                 "background": color, "border": _DECOUPLE_RING_COLOR,
                 "highlight": {"background": "#ffffff", "border": _DECOUPLE_RING_COLOR},
@@ -566,6 +592,41 @@ def to_html(
                 "color": {"color": _DECOUPLE_RING_COLOR, "opacity": 0.85},
             })
             continue
+        if data.get("kind") == "redirected_edge":
+            # A real dependency that used to touch an extracted member,
+            # repointed onto the diamond it would move into — only visible
+            # once "Preview decoupled view" hides that member (hiding a node
+            # hides its own edges too, so the ORIGINAL edge just disappears;
+            # this is the NEW one taking its place). Solid, not dashed: this
+            # coupling is real today, only its endpoint moved.
+            weight = data.get("weight", 1)
+            vis_edges.append({
+                "from": data.get("_src", u),
+                "to": data.get("_tgt", v),
+                "label": data.get("relation", ""),
+                "title": _html.escape(f"redirected: {data.get('relation', '')} (x{weight})"),
+                "dashes": False,
+                "width": min(1 + weight, 4),
+                "color": {"color": "#38bdf8", "opacity": 0.75},
+            })
+            continue
+        if data.get("kind") == "new_coupling_edge":
+            # Both ends move into DIFFERENT new classes — coupling that is
+            # INVISIBLE today (an intra-class call) and only exists because
+            # of the split. This is split_risk_score's cross_group_edges
+            # made literal: the same number the risk balance already
+            # weighed, now drawn as the edge it actually is.
+            weight = data.get("weight", 1)
+            vis_edges.append({
+                "from": data.get("_src", u),
+                "to": data.get("_tgt", v),
+                "label": data.get("relation", ""),
+                "title": _html.escape(f"new coupling introduced by the split: {data.get('relation', '')} (x{weight})"),
+                "dashes": False,
+                "width": min(1 + weight, 4),
+                "color": {"color": "#f87171", "opacity": 0.85},
+            })
+            continue
         confidence = data.get("confidence", "EXTRACTED")
         relation = data.get("relation", "")
         true_src = data.get("_src", u)
@@ -601,11 +662,13 @@ def to_html(
     stats = f"{G.number_of_nodes()} nodes &middot; {G.number_of_edges()} edges &middot; {len(communities)} communities"
     # Only rendered when the graph carries at least one proposed (decouple)
     # node — a plain graph.html with nothing proposed stays functionally
-    # unchanged (no dead checkbox for a toggle with nothing to do).
-    score_toggle_html = (
+    # unchanged (no dead checkboxes for a toggle with nothing to do).
+    decouple_controls_html = (
+        '<label><input type="checkbox" id="decouple-view-cb" '
+        'onchange="setDecoupleView(this.checked)">Preview decoupled view '
+        '<span style="color:#666">(hide old, show ◆ proposed)</span></label>'
         '<label><input type="checkbox" id="score-toggle-cb" '
-        'onchange="setScoreMode(this.checked)">Show risk scores '
-        '<span style="color:#666">(◆ proposed)</span></label>'
+        'onchange="setScoreMode(this.checked)">Show risk scores</label>'
         if has_proposed else ""
     )
 
@@ -634,7 +697,7 @@ def to_html(
     <h3>Communities</h3>
     <div id="legend-controls">
       <label><input type="checkbox" id="select-all-cb" checked onchange="toggleAllCommunities(!this.checked)">Select All</label>
-      {score_toggle_html}
+      {decouple_controls_html}
     </div>
     <div id="legend"></div>
   </div>

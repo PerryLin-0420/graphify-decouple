@@ -315,6 +315,60 @@ def test_build_augmented_graph_adds_proposed_nodes_for_recommended_splits():
                 assert g2.nodes[m]["kind"] == "proposed"
 
 
+def test_build_augmented_graph_redirects_wiring_around_a_split():
+    """The core of 'how do the links change': an external caller into an
+    extracted member redirects onto that member's diamond; a call BETWEEN
+    two members that end up in DIFFERENT new classes becomes a new,
+    literal inter-class edge (new_coupling_edge — split_risk_score's
+    cross_group_edges made visible); a call between two members that end up
+    in the SAME new class disappears (it's internal now, not a cross-
+    boundary edge); the ownership edges are untouched (still just the one
+    "extract" edge, never doubled up by a redirect landing on the same pair).
+    """
+    g = nx.DiGraph()
+    g.add_node("god2", label="SplitGod", file_type="code", source_file="s.py", source_location="L1")
+    for nid in ("sa0", "sa1", "sb0"):
+        g.add_node(nid, label=f".{nid}()", file_type="code", source_file="s.py", source_location="L1")
+        g.add_edge("god2", nid, relation="method", confidence="EXTRACTED")
+    g.add_node("extcaller", label="extcaller()", file_type="code", source_file="ext.py", source_location="L1")
+    g.add_edge("extcaller", "sa0", relation="calls", confidence="EXTRACTED")  # external -> redirect
+    g.add_edge("sa1", "sb0", relation="calls", confidence="EXTRACTED")  # cross-group -> new coupling
+    g.add_edge("sa0", "sa1", relation="calls", confidence="EXTRACTED")  # same-group -> dropped
+
+    plan = {
+        "god_nodes": [{
+            "id": "god2",
+            "classification": "god_object",
+            "risk": {"recommendation": "split", "risk_before": 50.0, "risk_after": 10.0, "net_benefit": 40.0},
+            "proposed_groups": [
+                {"community_id": 10, "name": "Group A", "members": ["sa0", "sa1"],
+                 "member_labels": [], "cohesion_confidence": "high"},
+                {"community_id": 11, "name": "Group B", "members": ["sb0"],
+                 "member_labels": [], "cohesion_confidence": "high"},
+            ],
+        }],
+    }
+    communities = {10: ["sa0", "sa1"], 11: ["sb0"]}
+    g2, _ = build_augmented_graph(g, plan, communities)
+
+    diamond_a = next(n for n, d in g2.nodes(data=True) if d.get("kind") == "proposed" and d["label"] == "Group A")
+    diamond_b = next(n for n, d in g2.nodes(data=True) if d.get("kind") == "proposed" and d["label"] == "Group B")
+
+    assert g2.nodes["sa0"]["decouple_extracted_into"] == diamond_a
+    assert g2.nodes["sb0"]["decouple_extracted_into"] == diamond_b
+
+    assert g2.get_edge_data("extcaller", diamond_a)["kind"] == "redirected_edge"
+    assert g2.get_edge_data(diamond_a, diamond_b)["kind"] == "new_coupling_edge"
+    assert not g2.has_edge(diamond_a, diamond_a)  # same-group edge did not survive as a self-loop
+
+    # ownership edges are untouched — exactly one edge god2->diamond_a, still "proposed_edge"
+    assert g2.get_edge_data("god2", diamond_a)["kind"] == "proposed_edge"
+
+    # the ORIGINAL edges are left alone too (the toggle hides nodes, not edges)
+    assert g2.has_edge("extcaller", "sa0")
+    assert g2.has_edge("sa1", "sb0")
+
+
 def test_build_augmented_graph_skips_residual_and_non_god_object():
     g = _build_graph()
     communities = _communities_for(g)

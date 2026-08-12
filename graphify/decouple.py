@@ -432,15 +432,28 @@ def build_augmented_graph(
     `keep_as_is` candidate was already weighed by `balance_risk` and found
     not worth it — the balanced verdict IS the number (risk_before vs
     risk_after in DECOUPLE_PLAN.md / decouple.json), so there is nothing
-    useful added by also drawing it on the graph. Showing it there would
-    just be a shape asking to be second-guessed by eye.
+    useful added by also drawing it on the graph.
+
+    Adding the diamond alone does not show how the WIRING changes — the real
+    members and their edges are still sitting there unchanged. So every real
+    member of a recommended group is marked `decouple_extracted_into=<diamond
+    id>`, and every edge that touches one is redirected onto the diamond it
+    would move into (`kind="redirected_edge"` for an edge to something
+    outside the split, `kind="new_coupling_edge"` when BOTH ends move into
+    DIFFERENT new classes — the coupling the split itself introduces,
+    already scored by `split_risk_score`). `exporters.html.to_html` renders
+    a "Preview decoupled view" toggle that hides the extracted real nodes and
+    shows the diamonds + redirected edges in their place — same graph,
+    before/after, not two disconnected pictures. An edge whose both ends move
+    into the SAME new class becomes purely internal and is dropped, not
+    redirected. `method`/`contains`/`defines` ownership edges (the god node's
+    own edge to each member) are skipped here — they are already the single
+    "extract" edge below.
 
     The point of tagging rather than building a separate diagram: this graph
     is handed straight to `graphify.exporters.html.to_html()`, the SAME
     renderer that draws graph.html — identical physics, community colors,
-    search, legend, info panel. `exporters.html.to_html` reads the `kind` tag
-    to draw a proposed node as a dashed diamond instead of inventing a
-    second visual language.
+    search, legend, info panel.
 
     Each proposed node is placed in its TARGET community (the group's own
     `community_id`), not the god node's community — so hiding that
@@ -450,13 +463,24 @@ def build_augmented_graph(
     """
     G2 = G.copy()
     communities2 = {cid: list(members) for cid, members in communities.items()}
+    member_to_diamond: dict[str, str] = {}
+    diamond_ids: set[str] = set()
+    # G2 is a plain (non-multi) DiGraph — add_edge on an existing pair
+    # OVERWRITES it rather than adding a parallel edge. A member that itself
+    # calls another member of ITS OWN god node via a non-ownership relation
+    # (e.g. an explicit "calls" alongside the "method" edge) would otherwise
+    # redirect onto the exact same (god_id, diamond_id) pair as the "extract"
+    # edge below and silently clobber its styling. Track those pairs and
+    # skip any redirect that would land on one — the extract edge is
+    # canonical, never overwritten.
+    extract_pairs: set[tuple[str, str]] = set()
     counter = 0
+
     for entry in plan.get("god_nodes", []):
         if entry.get("classification") != "god_object":
             continue
         risk = entry.get("risk", {})
-        recommendation = risk.get("recommendation", "split")
-        if recommendation != "split":
+        if risk.get("recommendation") != "split":
             continue
         god_id = entry["id"]
         for g in entry.get("proposed_groups", []):
@@ -471,12 +495,13 @@ def build_augmented_graph(
                 file_type="concept",
                 source_file="",
                 kind="proposed",
-                decouple_recommendation=recommendation,
+                hidden=True,  # default view is "before" — the toggle reveals it
+                decouple_recommendation="split",
                 decouple_risk={
                     "risk_before": risk.get("risk_before"),
                     "risk_after": risk.get("risk_after"),
                     "net_benefit": risk.get("net_benefit"),
-                    "recommendation": recommendation,
+                    "recommendation": "split",
                 },
                 member_count=len(g["members"]),
                 cohesion_confidence=g.get("cohesion_confidence"),
@@ -486,10 +511,52 @@ def build_augmented_graph(
                 relation="extract",
                 confidence="EXTRACTED",
                 kind="proposed_edge",
-                decouple_recommendation=recommendation,
+                decouple_recommendation="split",
                 _src=god_id, _tgt=node_id,
             )
             communities2.setdefault(cid, []).append(node_id)
+            diamond_ids.add(node_id)
+            extract_pairs.add((god_id, node_id))
+            for m in g["members"]:
+                member_to_diamond[m] = node_id
+                if m in G2.nodes:
+                    G2.nodes[m]["decouple_extracted_into"] = node_id
+
+    if not member_to_diamond:
+        return G2, communities2
+
+    # Redirect every non-ownership edge that touches an extracted member.
+    # Aggregated by (new_src, new_tgt) so many original calls collapse into
+    # ONE drawn edge with a weight, instead of cluttering the page.
+    redirects: dict[tuple[str, str], dict[str, Any]] = {}
+    for a, b, data in G.edges(data=True):
+        if data.get("relation") in MEMBER_RELATIONS:
+            continue  # already the single "extract" edge above
+        a_moved = a in member_to_diamond
+        b_moved = b in member_to_diamond
+        if not a_moved and not b_moved:
+            continue
+        new_a = member_to_diamond.get(a, a)
+        new_b = member_to_diamond.get(b, b)
+        if new_a == new_b:
+            continue  # both ends move into the SAME new class -> now internal
+        if (new_a, new_b) in extract_pairs:
+            continue  # would collide with the canonical "extract" edge
+        info = redirects.setdefault((new_a, new_b), {"count": 0, "relations": set()})
+        info["count"] += 1
+        info["relations"].add(str(data.get("relation", "")) or "calls")
+
+    for (new_a, new_b), info in redirects.items():
+        kind = "new_coupling_edge" if new_a in diamond_ids and new_b in diamond_ids else "redirected_edge"
+        G2.add_edge(
+            new_a, new_b,
+            relation=", ".join(sorted(info["relations"])),
+            confidence="EXTRACTED",
+            kind=kind,
+            weight=info["count"],
+            _src=new_a, _tgt=new_b,
+        )
+
     return G2, communities2
 
 
