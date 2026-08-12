@@ -1,9 +1,9 @@
 <p align="center">
-  <a href="https://graphify.com"><img src="https://raw.githubusercontent.com/Graphify-Labs/graphify/v8/docs/logo.png" width="300" height="140" alt="Graphify"/></a>
+  <img src="docs/logo-decouple.svg" width="420" height="64" alt="Graphify Decouple"/>
 </p>
 
 <p align="center">
-  <a href="https://trendshift.io/repositories/25296?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-25296" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/25296" alt="Graphify-Labs%2Fgraphify | Trendshift" width="250" height="55"/></a>
+  <b>A fork of <a href="https://github.com/Graphify-Labs/graphify">graphify</a> that adds <code>graphify decouple</code></b> — 0-LLM, risk-scored Extract-Class candidates for god objects, re-verified against the actual source (not just the call graph) before it recommends anything. See <a href="#decouple-risk-scored-extract-class-candidates">Decouple: risk-scored Extract-Class candidates</a> below.
 </p>
 
 <div align="center">
@@ -95,6 +95,64 @@ Shortest path (3 hops):
 ```
 
 Every edge carries a **confidence tag** (`EXTRACTED` = explicit in the source, `INFERRED` = derived by resolution), so you can tell what was read directly from what was inferred. `graphify query "<question>"` returns a scoped subgraph for a plain-language question, and `graphify path A B` traces how any two things connect.
+
+---
+
+## Decouple: risk-scored Extract-Class candidates
+
+<p align="center">
+  <img src="docs/decouple-demo.svg" alt="graphify decouple: MainWindow god node splitting into risk-scored candidate classes, with a shared-state warning between two of them" width="900">
+</p>
+
+`graphify decouple` finds god objects and tells you whether splitting them is actually worth it — not just that they're big.
+
+The failure mode this exists to catch: a class with 47 methods that call-graph clustering happily splits into 5 tidy-looking groups, all of which still read and write the exact same `self._chart_style` / `self._crosshair` instance state underneath. Ship that split and you haven't decoupled anything — you've moved methods into new files that still can't be tested, changed, or reasoned about independently, because they all still need the same shared state passed back in. A tool that only looks at the call graph cannot see this at all; it has to go back to the actual source.
+
+**Two checks, both 0-LLM, both deterministic:**
+
+1. **Is this even a God Object?** A node with a high degree can be a true God Object (many of its OWN methods, spread across unrelated responsibilities — Extract Class applies) or an over-referenced hub/data model (few own methods, mostly *incoming* references — splitting its body does nothing; the fix is narrowing its interface, not extracting a class). `classify_god_node` tells these apart by `member_ratio`, not raw degree — the difference that keeps `TraceSource` (84 edges, but only 6 of its own methods) from getting a bogus split suggestion that `MainWindow` (88 edges, 47 of its own methods) correctly gets.
+2. **Would the split actually reduce coupling?** `risk_before` (the god node's current size/coupling/fragmentation) is compared against `risk_after` — the NEW risk the split itself would introduce: cross-group calls that were invisible intra-class edges and become explicit inter-class dependencies, callers that would now need to depend on more than one new class, and — the check a call graph structurally cannot do — how much `self`/`this` instance state (reads, writes, and shared helper-method calls, weighted separately: a shared **write** is scored higher than a shared read) the proposed groups actually have in common. This re-parses the god node's own source file directly with tree-sitter; it does not rely on graphify's own extracted graph, which never records field-level access for any language. Only when `risk_after` clears a threshold below `risk_before` does the plan recommend `split` — otherwise it's `marginal` or `keep_as_is`, and a discouraged candidate is reported as a number, never drawn as a shape you have to second-guess by eye.
+
+```bash
+graphify decouple                              # analyze graphify-out/graph.json
+graphify decouple --project-root .             # + the state-sharing check (recommended)
+graphify decouple --top 20 --min-group-size 2  # more god nodes, smaller candidate groups
+graphify decouple --no-state-check             # call-graph-only scoring (skips the source re-parse)
+graphify decouple --json                       # print decouple.json to stdout
+```
+
+Outputs three files next to `graph.json`:
+
+```
+graphify-out/
+├── DECOUPLE_PLAN.md   # human-readable: per god node, classification, risk_before -> risk_after,
+│                      # which methods move where, and exactly which attributes/writes/calls are shared
+├── decouple.json      # the same plan as structured data — feed it to any AI or script
+└── DECOUPLE.html      # the SAME force-directed graph.html renderer, not a separate diagram:
+                       # a "Preview decoupled view" toggle swaps the real methods for the proposed
+                       # classes and re-routes their edges live, so you see the wiring change, not
+                       # just a before/after screenshot; click any proposed class to see exactly
+                       # which other class it shares state with and what specifically is shared
+```
+
+**Language coverage for the state-sharing check** (the call-graph-only classification above works for every language graphify extracts; this table is specifically the source re-parse that verifies `self`/`this` state overlap):
+
+| Language | Supported | Notes |
+|---|---|---|
+| Python | ✅ | `self.x` |
+| JavaScript / TypeScript | ✅ | `this.x` |
+| Java | ✅ | `this.foo()` is its own AST node, not a wrapped field access — handled explicitly |
+| C# | ✅ | |
+| Rust | ✅ | `self.x` via `impl` blocks |
+| Ruby | ✅ | `@x` (the dominant idiom) + `self.foo` calls |
+| PHP | ✅ | `$this->x` |
+| Swift | ✅ | `self.x` |
+| Kotlin | ✅ | `this.x` |
+| C++ | ✅ | `this->x` |
+| Go | ✅ | per-method receiver resolution — Go has no `self`/`this` keyword, so the receiver name (`f` in `func (f *Foo) M()`) is resolved fresh for every method |
+| C | ❌ | a struct-pointer parameter has no syntactic marker distinguishing it from any other parameter — no reliable signal without full type inference |
+
+A god node in an unsupported language, or one whose source can't be read, is marked `state_analysis: "skipped"` — the classification and call-graph score still run, but the recommendation rests on the call graph alone rather than silently assuming the state check passed.
 
 ---
 
@@ -392,9 +450,11 @@ graphify prs                       # PR dashboard: CI state, review status, work
 graphify prs 42                    # deep dive on PR #42 with graph impact
 graphify prs --triage              # AI ranks your review queue (uses whatever backend is configured)
 graphify prs --conflicts           # PRs sharing graph communities — merge-order risk
+
+graphify decouple --project-root .   # risk-scored Extract-Class candidates for god objects
 ```
 
-See the [full command reference](#full-command-reference) below.
+See [Decouple: risk-scored Extract-Class candidates](#decouple-risk-scored-extract-class-candidates) above, or the [full command reference](#full-command-reference) below.
 
 ---
 
@@ -783,6 +843,18 @@ graphify cluster-only ./my-project --backend=gemini            # backend for com
 graphify cluster-only ./my-project --backend=gemini --model gemini-2.5-pro  # specific model
 graphify label ./my-project                                    # (re)name communities with the configured backend
 graphify label ./my-project --backend=openai --model gpt-4o   # force a specific backend and model
+
+graphify decouple                                    # analyze graphify-out/graph.json, call-graph score only
+graphify decouple --graph path/to/graph.json          # custom graph location
+graphify decouple --project-root .                    # + the self/this state-sharing check (see language table above)
+graphify decouple --top 20                            # analyze more god nodes (default 10)
+graphify decouple --min-group-size 2                  # allow smaller candidate groups (default 3)
+graphify decouple --net-benefit-threshold 10          # require a bigger margin before recommending a split (default 5.0)
+graphify decouple --extracted-only                    # ignore INFERRED/AMBIGUOUS member edges
+graphify decouple --no-state-check                    # skip the source re-parse, call-graph-only scoring
+graphify decouple --output-dir docs/decouple           # write DECOUPLE_PLAN.md/decouple.json/DECOUPLE.html elsewhere
+graphify decouple --no-html                           # skip DECOUPLE.html generation
+graphify decouple --json                              # print decouple.json to stdout instead of writing files
 ```
 
 > **Community names:** inside an agent (Claude Code, Gemini CLI) the agent names communities itself. When you run the bare CLI, `cluster-only` auto-names them with the configured backend (built-in or custom OpenAI-compatible provider) — pass `--no-label` to keep `Community N`, or run `graphify label` to (re)generate names on demand.
