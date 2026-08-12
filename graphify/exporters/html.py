@@ -130,6 +130,7 @@ const nodesDS = new vis.DataSet(RAW_NODES.map(n => {{
     _kind: n.kind || 'real', _risk: n.risk || null,
     _label_plain: n.label, _label_scored: n.label_scored || n.label,
     _extracted_into: n.extracted_into || null,
+    _state_overlaps: n.state_overlaps || null,
   }};
   // Conditional keys only — an explicit `undefined` on a vis.DataSet item can
   // still override the network-wide default (e.g. shape: 'dot'), so these are
@@ -201,6 +202,13 @@ function showInfo(nodeId) {{
     ${{n._risk ? `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Decouple risk</div>
     <div class="field">Recommendation: <b>${{esc(n._risk.recommendation)}}</b></div>
     <div class="field">risk_before &rarr; risk_after: ${{n._risk.risk_before}} &rarr; ${{n._risk.risk_after}} (net ${{n._risk.net_benefit}})</div>` : ''}}
+    ${{n._state_overlaps && n._state_overlaps.length ? `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Shares state with</div>
+    ${{n._state_overlaps.map(o => `
+      <div class="field" style="margin-top:4px"><b>${{esc(o.with)}}</b> — overlap ${{o.overlap}} (fields ${{o.field_overlap}}, calls ${{o.call_overlap}})</div>
+      ${{o.shared_writes.length ? `<div class="field" style="color:#f87171;font-size:11px">writes: ${{o.shared_writes.map(esc).join(', ')}}</div>` : ''}}
+      ${{o.shared_attrs.length ? `<div class="field" style="font-size:11px">fields: ${{o.shared_attrs.map(esc).join(', ')}}</div>` : ''}}
+      ${{o.shared_calls.length ? `<div class="field" style="font-size:11px">calls: ${{o.shared_calls.map(esc).join(', ')}}</div>` : ''}}
+    `).join('')}}` : ''}}
     ${{n._extracted_into ? `<div class="field" style="margin-top:8px;color:#94a3b8;font-size:11px">Would move into: ${{esc((nodesDS.get(n._extracted_into) || {{}}).label || n._extracted_into)}}</div>` : ''}}
     ${{neighborIds.length ? `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Neighbors (${{neighborIds.length}})</div><div id="neighbors-list">${{neighborItems}}</div>` : ''}}
   `;
@@ -567,6 +575,18 @@ def to_html(
                     f"{label} — proposed extraction, "
                     f"risk {risk.get('risk_before')}→{risk.get('risk_after')}"
                 )
+            state_overlaps = data.get("decouple_state_overlaps")
+            if state_overlaps:
+                node["state_overlaps"] = [
+                    {
+                        "with": sanitize_label(str(o["with"])),
+                        "overlap": o["overlap"], "field_overlap": o["field_overlap"], "call_overlap": o["call_overlap"],
+                        "shared_attrs": [sanitize_label(str(a)) for a in o["shared_attrs"][:10]],
+                        "shared_writes": [sanitize_label(str(a)) for a in o["shared_writes"][:10]],
+                        "shared_calls": [sanitize_label(str(a)) for a in o["shared_calls"][:10]],
+                    }
+                    for o in state_overlaps
+                ]
         vis_nodes.append(node)
 
     # Build edges list. Restore original edge direction from _src/_tgt

@@ -286,7 +286,12 @@ def _group_state_overlap(
             continue
         pairs.append({
             "group_a": ga["name"], "group_b": gb["name"],
-            "overlap": ov["overlap"], "shared_attrs": ov["shared_attrs"],
+            "overlap": ov["overlap"],
+            "field_overlap": ov["field_overlap"],
+            "call_overlap": ov["call_overlap"],
+            "shared_attrs": ov["shared_attrs"],
+            "shared_writes": ov["shared_writes"],
+            "shared_calls": ov["shared_calls"],
         })
     if not pairs:
         return None
@@ -597,12 +602,33 @@ def build_augmented_graph(
         if risk.get("recommendation") != "split":
             continue
         god_id = entry["id"]
+        state_pairs = risk.get("split_detail", {}).get("state_overlap_pairs", [])
         for g in entry.get("proposed_groups", []):
             cid = g.get("community_id")
             if cid is None:
                 continue
             node_id = f"_proposed_{god_id}_{counter}"
             counter += 1
+            # Pairs involving THIS group, from the other side's perspective —
+            # so the info panel can say "shares X with Y" when you click
+            # either diamond, not just when you click the one named group_a.
+            my_overlaps = []
+            for pair in state_pairs:
+                if pair["group_a"] == g["name"]:
+                    other = pair["group_b"]
+                elif pair["group_b"] == g["name"]:
+                    other = pair["group_a"]
+                else:
+                    continue
+                if pair["overlap"] <= 0:
+                    continue
+                my_overlaps.append({
+                    "with": other, "overlap": pair["overlap"],
+                    "field_overlap": pair["field_overlap"], "call_overlap": pair["call_overlap"],
+                    "shared_attrs": pair["shared_attrs"], "shared_writes": pair["shared_writes"],
+                    "shared_calls": pair["shared_calls"],
+                })
+            my_overlaps.sort(key=lambda o: -o["overlap"])
             G2.add_node(
                 node_id,
                 label=g["name"],
@@ -617,6 +643,7 @@ def build_augmented_graph(
                     "net_benefit": risk.get("net_benefit"),
                     "recommendation": "split",
                 },
+                decouple_state_overlaps=my_overlaps,
                 member_count=len(g["members"]),
                 cohesion_confidence=g.get("cohesion_confidence"),
             )
@@ -713,8 +740,14 @@ def render_markdown(plan: dict[str, Any]) -> str:
                             continue
                         lines.append(
                             f"    - `{pair['group_a']}` <-> `{pair['group_b']}`: "
-                            f"overlap={pair['overlap']}, shared: {', '.join(pair['shared_attrs'][:8])}"
+                            f"overlap={pair['overlap']} (fields={pair['field_overlap']}, calls={pair['call_overlap']})"
                         )
+                        if pair["shared_attrs"]:
+                            lines.append(f"      shared fields: {', '.join(pair['shared_attrs'][:8])}")
+                        if pair["shared_writes"]:
+                            lines.append(f"      shared WRITES (both mutate): {', '.join(pair['shared_writes'][:8])}")
+                        if pair["shared_calls"]:
+                            lines.append(f"      shared helper calls: {', '.join(pair['shared_calls'][:8])}")
                 else:
                     lines.append(f"  - state-sharing check: {sd.get('state_analysis', 'skipped')}")
             for g in entry.get("proposed_groups", []):
