@@ -100,8 +100,15 @@ Jede Kante trägt ein **Konfidenz-Tag** (`EXTRACTED` = explizit in der Quelle, `
   <img src="../decouple-screenshot.svg" alt="DECOUPLE.html: Die 5 vorgeschlagenen Klassen von MainWindow, das Node-Info-Panel ist für Main Window Axis and Range Controls geöffnet und zeigt eine State-Überlappung von 0,608 mit Main Window Controller Core" width="900">
 </p>
 <p align="center">
-  <em>DECOUPLE.html bei einem echten Lauf (AutoCheck/Touchstone Explorer) — ein Klick auf eine vorgeschlagene Klasse zeigt genau, mit welcher anderen Klasse sie sich State teilt und was konkret geteilt wird.</em>
+  <em>DECOUPLE.html bei einem echten Lauf — ein Klick auf eine vorgeschlagene Klasse zeigt genau, mit welcher anderen Klasse sie sich State teilt und was konkret geteilt wird.</em>
 </p>
+
+Dieselbe Seite rendert auch die Aufteilung selbst. Der Schalter **Preview decoupled view** ersetzt die eigenen Methoden der God-Klasse durch die vorgeschlagenen Klassen und verlegt die Kanten an Ort und Stelle — die Verdrahtungsänderung, kein neu gezeichnetes Diagramm:
+
+| Vorher — die God-Klasse heute | Nachher — Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-before.png" alt="DECOUPLE.html vor dem Umschalten: ein einzelner MainWindow-Hub-Knoten, um den herum seine eigenen Methoden aufgefächert sind" width="440"> | <img src="../decouple-after.png" alt="DECOUPLE.html nach dem Umschalten: derselbe Knoten reduziert auf 5 rautenförmige vorgeschlagene Klassen, grün gestrichelte Kanten zeigen, welche Methoden in welche Klasse extrahiert wurden, rote Kanten den geteilten Instanz-State zwischen zweien davon" width="440"> |
+| Ein Knoten mit 47 eigenen Methoden, von denen jede einzelne nur über die Klasse erreichbar ist. | Die vorgeschlagenen Klassen. Grün gestrichelt = was in welche extrahiert wurde; rot = der Instanz-State, den zwei davon weiterhin teilen — genau das entscheidet zwischen `split` und `keep_as_is`. Gezeichnet werden nur Kandidaten, die den Risikoschwellwert bestehen — hier 5 von 6, weshalb eine Methode keine Raute hat, auf der sie landen könnte. |
 
 `graphify decouple` findet God Objects und sagt dir, ob sich eine Aufteilung tatsächlich lohnt — nicht nur, dass sie groß sind.
 

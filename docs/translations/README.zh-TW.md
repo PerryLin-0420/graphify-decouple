@@ -100,8 +100,15 @@ Shortest path (3 hops):
   <img src="../decouple-screenshot.svg" alt="DECOUPLE.html:MainWindow 提出的 5 個類別,Node Info 面板開啟於 Main Window Axis and Range Controls,顯示與 Main Window Controller Core 有 0.608 的狀態重疊" width="900">
 </p>
 <p align="center">
-  <em>DECOUPLE.html 在一次真實執行(AutoCheck/Touchstone Explorer)上的畫面 — 點擊任一個提議的類別,就能準確看到它和哪個類別共享狀態,以及具體共享了什麼。</em>
+  <em>DECOUPLE.html 在一次真實執行上的畫面 — 點擊任一個提議的類別,就能準確看到它和哪個類別共享狀態,以及具體共享了什麼。</em>
 </p>
+
+同一個頁面也會直接畫出拆分本身。切換 **Preview decoupled view** 會把神級類別自己的方法換成提議的類別,並就地重新接線 — 你看到的是接線的變化,而不是另外畫一張圖:
+
+| 拆分前 — 今天的神級類別 | 拆分後 — Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-before.png" alt="切換前的 DECOUPLE.html:單一個 MainWindow 樞紐節點,自己的方法向四周展開" width="440"> | <img src="../decouple-after.png" alt="切換後的 DECOUPLE.html:同一個節點縮成 5 個菱形的提議類別,綠色虛線代表哪些方法被抽取到各個類別,紅色線代表其中兩個類別仍共享的實例狀態" width="440"> |
+| 一個節點裡放著自己的 47 個方法,每一個都只能透過這個類別才能取用。 | 提議的類別。綠色虛線 = 哪些東西被抽取到各個類別;紅色 = 其中兩個類別仍然共享的實例狀態,而這正是決定 `split` 還是 `keep_as_is` 的關鍵。只有通過風險門檻的候選才會被畫出來 — 這裡是 6 個裡的 5 個,所以有一個方法沒有對應的菱形可以落腳。 |
 
 `graphify decouple` 會找出神級物件,並告訴你拆分它是否真的值得 — 而不只是告訴你它很大。
 

@@ -4,9 +4,9 @@ Pins the core distinction the feature depends on: a god node with many OWN
 members spread across communities ("god_object", Extract Class applies) is
 not the same thing as a god node with almost no own members but many
 INCOMING references ("over_referenced_hub", splitting its body does nothing
-for coupling). Real-corpus validation (AutoCheck/Touchstone Explorer) showed
-exactly this split: MainWindow/GroupAnalyzeDialog are god_object,
-TraceSource is over_referenced_hub despite having the 2nd-highest degree.
+for coupling). Validation against a real desktop-app corpus showed exactly
+this split: MainWindow/GroupAnalyzeDialog are god_object, TraceSource is
+over_referenced_hub despite having the 2nd-highest degree.
 """
 from __future__ import annotations
 

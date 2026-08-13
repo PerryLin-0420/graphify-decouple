@@ -100,8 +100,15 @@ Every edge carries a **confidence tag** (`EXTRACTED` = explicit in the source, `
   <img src="docs/decouple-screenshot.svg" alt="DECOUPLE.html: MainWindow's 5 proposed classes, Node Info panel open on Main Window Axis and Range Controls showing a 0.608 state overlap with Main Window Controller Core" width="900">
 </p>
 <p align="center">
-  <em>DECOUPLE.html on a real run (AutoCheck/Touchstone Explorer) — clicking a proposed class shows exactly which other class it shares state with, and what specifically is shared.</em>
+  <em>DECOUPLE.html on a real run — clicking a proposed class shows exactly which other class it shares state with, and what specifically is shared.</em>
 </p>
+
+The same page also renders the split itself. Toggling **Preview decoupled view** swaps the god class's own methods for the proposed classes and re-routes the edges in place — the wiring change, not a redrawn diagram:
+
+| Before — the god class today | After — Preview decoupled view |
+| --- | --- |
+| <img src="docs/decouple-before.png" alt="DECOUPLE.html before the toggle: a single MainWindow hub node with its own methods fanned out around it" width="440"> | <img src="docs/decouple-after.png" alt="DECOUPLE.html after the toggle: the same node reduced to 5 diamond-shaped proposed classes, green dashed edges showing which methods were extracted into each, red edges showing shared instance state between two of them" width="440"> |
+| One node holding 47 of its own methods, every one of them reachable only through the class. | The proposed classes. Green dashed = what got extracted into each; red = the instance state two of them still share, which is exactly what decides `split` vs `keep_as_is`. Only candidates that clear the risk threshold are drawn — here 5 of 6, which is why one method has no diamond to land on. |
 
 `graphify decouple` finds god objects and tells you whether splitting them is actually worth it — not just that they're big.
 

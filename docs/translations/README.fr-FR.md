@@ -100,8 +100,15 @@ Chaque lien porte une **étiquette de confiance** (`EXTRACTED` = explicite dans 
   <img src="../decouple-screenshot.svg" alt="DECOUPLE.html : les 5 classes proposées pour MainWindow, panneau Node Info ouvert sur Main Window Axis and Range Controls montrant un chevauchement d'état de 0.608 avec Main Window Controller Core" width="900">
 </p>
 <p align="center">
-  <em>DECOUPLE.html sur une exécution réelle (AutoCheck/Touchstone Explorer) — cliquer sur une classe proposée montre exactement avec quelle autre classe elle partage de l'état, et ce qui est précisément partagé.</em>
+  <em>DECOUPLE.html sur une exécution réelle — cliquer sur une classe proposée montre exactement avec quelle autre classe elle partage de l'état, et ce qui est précisément partagé.</em>
 </p>
+
+La même page rend également la division elle-même. Basculer **Preview decoupled view** remplace les méthodes propres de la god class par les classes proposées et réachemine les arêtes sur place — le changement de câblage, pas un diagramme redessiné :
+
+| Avant — la god class aujourd'hui | Après — Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-before.png" alt="DECOUPLE.html avant la bascule : un unique nœud pivot MainWindow avec ses propres méthodes déployées autour de lui" width="440"> | <img src="../decouple-after.png" alt="DECOUPLE.html après la bascule : le même nœud réduit à 5 classes proposées en losange, des arêtes vertes en pointillés montrant quelles méthodes ont été extraites dans chacune, des arêtes rouges montrant l'état d'instance partagé entre deux d'entre elles" width="440"> |
+| Un nœud contenant 47 de ses propres méthodes, chacune accessible uniquement à travers la classe. | Les classes proposées. Vert pointillé = ce qui a été extrait dans chacune ; rouge = l'état d'instance que deux d'entre elles partagent encore, ce qui décide précisément entre `split` et `keep_as_is`. Seuls les candidats qui franchissent le seuil de risque sont dessinés — ici 5 sur 6, d'où une méthode sans losange où atterrir. |
 
 `graphify decouple` repère les god objects et vous dit si les diviser en vaut réellement la peine — pas seulement s'ils sont gros.
 

@@ -100,8 +100,15 @@ Hver kant har en **konfidensmerking** (`EXTRACTED` = eksplisitt i kilden, `INFER
   <img src="../decouple-screenshot.svg" alt="DECOUPLE.html: MainWindows 5 foreslåtte klasser, Node Info-panelet åpent for Main Window Axis and Range Controls, og viser et 0,608 tilstandsoverlapp med Main Window Controller Core" width="900">
 </p>
 <p align="center">
-  <em>DECOUPLE.html fra en reell kjøring (AutoCheck/Touchstone Explorer) — å klikke på en foreslått klasse viser nøyaktig hvilken annen klasse den deler tilstand med, og hva som konkret er delt.</em>
+  <em>DECOUPLE.html fra en reell kjøring — å klikke på en foreslått klasse viser nøyaktig hvilken annen klasse den deler tilstand med, og hva som konkret er delt.</em>
 </p>
+
+Den samme siden rendrer også selve oppdelingen. Å slå på **Preview decoupled view** bytter ut god-klassens egne metoder med de foreslåtte klassene og ruter kantene om på stedet — selve koblingsendringen, ikke et omtegnet diagram:
+
+| Før — god-klassen i dag | Etter — Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-before.png" alt="DECOUPLE.html før veksling: én enkelt MainWindow-hubnode med sine egne metoder spredt rundt seg" width="440"> | <img src="../decouple-after.png" alt="DECOUPLE.html etter veksling: den samme noden redusert til 5 rombeformede foreslåtte klasser, grønne stiplede kanter som viser hvilke metoder som ble trukket ut i hver, og røde kanter som viser den delte instanstilstanden mellom to av dem" width="440"> |
+| Én node med 47 av sine egne metoder, som hver eneste bare kan nås gjennom klassen. | De foreslåtte klassene. Grønn stiplet = hva som ble trukket ut i hver; rød = instanstilstanden to av dem fortsatt deler, som er nøyaktig det som avgjør `split` mot `keep_as_is`. Bare kandidater som klarer risikoterskelen tegnes — her 5 av 6, og derfor har én metode ingen rombe å lande på. |
 
 `graphify decouple` finner gudobjekter og forteller deg om det faktisk er verdt å splitte dem — ikke bare at de er store.
 

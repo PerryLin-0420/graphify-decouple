@@ -100,8 +100,15 @@ Varje kant bär en **konfidensmärkning** (`EXTRACTED` = explicit i källan, `IN
   <img src="../decouple-screenshot.svg" alt="DECOUPLE.html: MainWindows 5 föreslagna klasser, Node Info-panelen öppen på Main Window Axis and Range Controls och visar 0.608 state-överlapp med Main Window Controller Core" width="900">
 </p>
 <p align="center">
-  <em>DECOUPLE.html i en verklig körning (AutoCheck/Touchstone Explorer) — att klicka på en föreslagen klass visar exakt vilken annan klass den delar state med, och vad som specifikt delas.</em>
+  <em>DECOUPLE.html i en verklig körning — att klicka på en föreslagen klass visar exakt vilken annan klass den delar state med, och vad som specifikt delas.</em>
 </p>
+
+Samma sida renderar också själva uppdelningen. Att slå på **Preview decoupled view** byter ut god-klassens egna metoder mot de föreslagna klasserna och drar om kanterna på plats — själva kopplingsändringen, inte ett omritat diagram:
+
+| Före — god-klassen idag | Efter — Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-before.png" alt="DECOUPLE.html före växlingen: en enda MainWindow-hubbnod med sina egna metoder utspridda runt omkring" width="440"> | <img src="../decouple-after.png" alt="DECOUPLE.html efter växlingen: samma nod reducerad till 5 rombformade föreslagna klasser, gröna streckade kanter som visar vilka metoder som extraherades till var och en, och röda kanter som visar det delade instanstillståndet mellan två av dem" width="440"> |
+| En nod med 47 av sina egna metoder, där varje enskild bara går att nå genom klassen. | De föreslagna klasserna. Grönt streckat = vad som extraherades till var och en; rött = det instanstillstånd två av dem fortfarande delar, vilket är precis det som avgör `split` mot `keep_as_is`. Bara kandidater som klarar rikströskeln ritas ut — här 5 av 6, och därför har en metod ingen romb att landa på. |
 
 `graphify decouple` hittar god objects och talar om för dig om det faktiskt är värt att dela upp dem — inte bara att de är stora.
 

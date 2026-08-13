@@ -100,8 +100,15 @@ Elke edge draagt een **betrouwbaarheidslabel** (`EXTRACTED` = expliciet in de br
   <img src="../decouple-screenshot.svg" alt="DECOUPLE.html: de 5 voorgestelde klassen van MainWindow, Node Info-paneel geopend op Main Window Axis and Range Controls, met een state-overlap van 0,608 met Main Window Controller Core" width="900">
 </p>
 <p align="center">
-  <em>DECOUPLE.html bij een echte run (AutoCheck/Touchstone Explorer) — klik op een voorgestelde klasse en zie precies met welke andere klasse hij state deelt, en wat er specifiek wordt gedeeld.</em>
+  <em>DECOUPLE.html bij een echte run — klik op een voorgestelde klasse en zie precies met welke andere klasse hij state deelt, en wat er specifiek wordt gedeeld.</em>
 </p>
+
+Dezelfde pagina rendert ook de splitsing zelf. Met **Preview decoupled view** wissel je de eigen methodes van de god class in voor de voorgestelde klassen en worden de edges ter plekke opnieuw gerouteerd — de bedradingswijziging, niet een opnieuw getekend diagram:
+
+| Voor — de god class vandaag | Na — Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-before.png" alt="DECOUPLE.html vóór de toggle: één MainWindow-hubknoop met zijn eigen methodes eromheen uitgewaaierd" width="440"> | <img src="../decouple-after.png" alt="DECOUPLE.html na de toggle: dezelfde knoop teruggebracht tot 5 ruitvormige voorgestelde klassen, groen gestippelde edges die tonen welke methodes in welke klasse zijn geëxtraheerd, rode edges die de gedeelde instance state tussen twee ervan tonen" width="440"> |
+| Eén knoop met 47 eigen methodes, die stuk voor stuk alleen via de klasse bereikbaar zijn. | De voorgestelde klassen. Groen gestippeld = wat er in elke klasse is geëxtraheerd; rood = de instance state die twee ervan nog steeds delen, precies wat de keuze tussen `split` en `keep_as_is` bepaalt. Alleen kandidaten die de risicodrempel halen worden getekend — hier 5 van 6, en daarom heeft één methode geen ruit om op te landen. |
 
 `graphify decouple` vindt god-objecten en vertelt je of ze splitsen daadwerkelijk de moeite waard is — niet alleen dát ze groot zijn.
 

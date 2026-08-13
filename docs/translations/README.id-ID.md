@@ -100,8 +100,15 @@ Setiap edge membawa **tag kepercayaan** (`EXTRACTED` = eksplisit di kode sumber,
   <img src="../decouple-screenshot.svg" alt="DECOUPLE.html: 5 kelas yang diusulkan untuk MainWindow, panel Node Info terbuka pada Main Window Axis and Range Controls menunjukkan overlap state 0.608 dengan Main Window Controller Core" width="900">
 </p>
 <p align="center">
-  <em>DECOUPLE.html pada jalankan nyata (AutoCheck/Touchstone Explorer) — mengklik satu kelas yang diusulkan menunjukkan tepat kelas mana lagi yang berbagi state dengannya, dan apa persisnya yang dibagikan.</em>
+  <em>DECOUPLE.html pada jalankan nyata — mengklik satu kelas yang diusulkan menunjukkan tepat kelas mana lagi yang berbagi state dengannya, dan apa persisnya yang dibagikan.</em>
 </p>
+
+Halaman yang sama juga merender pemecahannya sendiri. Mengaktifkan **Preview decoupled view** menukar method milik god class dengan kelas-kelas yang diusulkan dan merutekan ulang edge-nya di tempat — perubahan sambungannya, bukan diagram yang digambar ulang:
+
+| Sebelum — god class hari ini | Sesudah — Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-before.png" alt="DECOUPLE.html sebelum toggle: satu node hub MainWindow dengan method-method miliknya terbentang di sekelilingnya" width="440"> | <img src="../decouple-after.png" alt="DECOUPLE.html sesudah toggle: node yang sama menyusut menjadi 5 kelas usulan berbentuk belah ketupat, edge hijau putus-putus menunjukkan method mana yang diekstrak ke masing-masing, edge merah menunjukkan state instance yang masih dibagi antara dua di antaranya" width="440"> |
+| Satu node berisi 47 method miliknya sendiri, yang setiap satunya hanya bisa dijangkau lewat kelas itu. | Kelas-kelas yang diusulkan. Hijau putus-putus = apa yang diekstrak ke masing-masing; merah = state instance yang masih dibagi dua di antaranya, dan itulah yang menentukan `split` atau `keep_as_is`. Hanya kandidat yang lolos ambang risiko yang digambar — di sini 5 dari 6, itulah sebabnya satu method tidak punya belah ketupat untuk mendarat. |
 
 `graphify decouple` menemukan god object dan memberi tahu Anda apakah memecahnya benar-benar sepadan — bukan sekadar bahwa objek itu besar.
 

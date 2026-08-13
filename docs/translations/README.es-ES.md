@@ -100,8 +100,15 @@ Cada arista lleva una **etiqueta de confianza** (`EXTRACTED` = explícita en el 
   <img src="../decouple-screenshot.svg" alt="DECOUPLE.html: las 5 clases propuestas de MainWindow, con el panel Node Info abierto en Main Window Axis and Range Controls mostrando una superposición de estado de 0.608 con Main Window Controller Core" width="900">
 </p>
 <p align="center">
-  <em>DECOUPLE.html en una ejecución real (AutoCheck/Touchstone Explorer) — al hacer clic en una clase propuesta se muestra exactamente con qué otra clase comparte estado, y qué se comparte específicamente.</em>
+  <em>DECOUPLE.html en una ejecución real — al hacer clic en una clase propuesta se muestra exactamente con qué otra clase comparte estado, y qué se comparte específicamente.</em>
 </p>
+
+La misma página también renderiza la división en sí. Alternar **Preview decoupled view** cambia los métodos propios de la god class por las clases propuestas y reencamina las aristas en el sitio: el cambio de cableado, no un diagrama redibujado:
+
+| Antes — la god class hoy | Después — Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-before.png" alt="DECOUPLE.html antes del cambio: un único nodo central MainWindow con sus propios métodos desplegados a su alrededor" width="440"> | <img src="../decouple-after.png" alt="DECOUPLE.html después del cambio: el mismo nodo reducido a 5 clases propuestas con forma de rombo, aristas verdes discontinuas que muestran qué métodos se extrajeron a cada una, y aristas rojas que muestran el estado de instancia compartido entre dos de ellas" width="440"> |
+| Un nodo que contiene 47 de sus propios métodos, cada uno accesible solo a través de la clase. | Las clases propuestas. Verde discontinuo = lo que se extrajo a cada una; rojo = el estado de instancia que dos de ellas siguen compartiendo, que es exactamente lo que decide entre `split` y `keep_as_is`. Solo se dibujan los candidatos que superan el umbral de riesgo: aquí 5 de 6, por eso un método se queda sin rombo donde aterrizar. |
 
 `graphify decouple` encuentra objetos dios y te dice si dividirlos merece realmente la pena, no solo que son grandes.
 

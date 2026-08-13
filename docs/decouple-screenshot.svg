@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 760" width="1280" height="760" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" role="img" aria-label="DECOUPLE.html: MainWindow split into 5 candidate classes, Node Info panel open on Main Window Axis and Range Controls showing a 0.608 state overlap with Main Window Controller Core">
   <!-- Faithful static recreation of graphify decouple's actual DECOUPLE.html page (exporters/html.py),
-       using the real page CSS colors (#0f0f1a body / #1a1a2e sidebar) and the REAL AutoCheck run's data
+       using the real page CSS colors (#0f0f1a body / #1a1a2e sidebar) and data from a real run
        (MainWindow's 5 proposed groups, real risk numbers, real shared-attribute names) — not a pixel
        screenshot (the in-session browser pane could not be captured), but every number and label here
        is copied verbatim from decouple.json. -->

@@ -100,8 +100,15 @@ Ogni collegamento porta un **tag di confidenza** (`EXTRACTED` = esplicito nel co
   <img src="../decouple-screenshot.svg" alt="DECOUPLE.html: le 5 classi proposte per MainWindow, pannello Node Info aperto su Main Window Axis and Range Controls che mostra una sovrapposizione di stato di 0.608 con Main Window Controller Core" width="900">
 </p>
 <p align="center">
-  <em>DECOUPLE.html su un'esecuzione reale (AutoCheck/Touchstone Explorer) — cliccando su una classe proposta mostra esattamente con quale altra classe condivide stato, e cosa esattamente viene condiviso.</em>
+  <em>DECOUPLE.html su un'esecuzione reale — cliccando su una classe proposta mostra esattamente con quale altra classe condivide stato, e cosa esattamente viene condiviso.</em>
 </p>
+
+La stessa pagina renderizza anche la divisione vera e propria. Attivare **Preview decoupled view** sostituisce i metodi propri della god class con le classi proposte e re-instrada gli archi sul posto — il cambio di cablaggio, non un diagramma ridisegnato:
+
+| Prima — la god class oggi | Dopo — Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-before.png" alt="DECOUPLE.html prima del toggle: un singolo nodo hub MainWindow con i suoi metodi disposti tutt'intorno" width="440"> | <img src="../decouple-after.png" alt="DECOUPLE.html dopo il toggle: lo stesso nodo ridotto a 5 classi proposte a forma di rombo, archi verdi tratteggiati che mostrano quali metodi sono stati estratti in ciascuna, archi rossi che mostrano lo stato di istanza condiviso tra due di esse" width="440"> |
+| Un nodo che contiene 47 dei suoi metodi, ognuno raggiungibile solo attraverso la classe. | Le classi proposte. Verde tratteggiato = cosa è stato estratto in ciascuna; rosso = lo stato di istanza che due di esse continuano a condividere, che è esattamente ciò che decide tra `split` e `keep_as_is`. Vengono disegnati solo i candidati che superano la soglia di rischio — qui 5 su 6, ed è per questo che un metodo resta senza rombo su cui atterrare. |
 
 `graphify decouple` trova i god object e ti dice se dividerli vale davvero la pena — non solo che sono grandi.
 

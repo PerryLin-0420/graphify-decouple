@@ -100,8 +100,15 @@ Shortest path (3 hops):
   <img src="../decouple-screenshot.svg" alt="DECOUPLE.html: MainWindow に提案された 5 つのクラス。Main Window Axis and Range Controls の Node Info パネルが開き、Main Window Controller Core との状態オーバーラップが 0.608 であることを示している" width="900">
 </p>
 <p align="center">
-  <em>実際の実行（AutoCheck/Touchstone Explorer）での DECOUPLE.html — 提案されたクラスをクリックすると、他のどのクラスと状態を共有しているか、具体的に何を共有しているかが正確に表示されます。</em>
+  <em>実際の実行での DECOUPLE.html — 提案されたクラスをクリックすると、他のどのクラスと状態を共有しているか、具体的に何を共有しているかが正確に表示されます。</em>
 </p>
+
+同じページが分割そのものも描画します。**Preview decoupled view** を切り替えると、god クラス自身のメソッドが提案クラスに置き換わり、エッジがその場で再配線されます — 描き直した図ではなく、配線の変化そのものです:
+
+| 分割前 — 現在の god クラス | 分割後 — Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-before.png" alt="トグル前の DECOUPLE.html: 単一の MainWindow ハブノードと、その周囲に広がる自身のメソッド群" width="440"> | <img src="../decouple-after.png" alt="トグル後の DECOUPLE.html: 同じノードが 5 つのひし形の提案クラスに縮小され、緑の破線がどのメソッドがどのクラスに抽出されたかを、赤い線が 2 つのクラスが共有したままのインスタンス状態を示している" width="440"> |
+| 1 つのノードが自身のメソッド 47 個を抱え、そのすべてがこのクラス経由でしか到達できません。 | 提案されたクラス群。緑の破線 = それぞれに何が抽出されたか、赤 = 2 つのクラスが依然として共有しているインスタンス状態で、これがまさに `split` か `keep_as_is` かを決めます。リスクしきい値を超えた候補だけが描画されます — ここでは 6 個中 5 個なので、1 つのメソッドには着地するひし形がありません。 |
 
 `graphify decouple` は god object を見つけ出し、それが単に「大きい」だけでなく、分割する価値が実際にあるかどうかを教えてくれます。
 

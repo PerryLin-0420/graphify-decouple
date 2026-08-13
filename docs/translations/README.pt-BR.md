@@ -100,8 +100,15 @@ Toda aresta carrega uma **etiqueta de confiança** (`EXTRACTED` = explícita no 
   <img src="../decouple-screenshot.svg" alt="DECOUPLE.html: as 5 classes propostas de MainWindow, painel Node Info aberto em Main Window Axis and Range Controls mostrando uma sobreposição de estado de 0,608 com Main Window Controller Core" width="900">
 </p>
 <p align="center">
-  <em>DECOUPLE.html em uma execução real (AutoCheck/Touchstone Explorer) — clicar em uma classe proposta mostra exatamente com qual outra classe ela compartilha estado, e o que especificamente é compartilhado.</em>
+  <em>DECOUPLE.html em uma execução real — clicar em uma classe proposta mostra exatamente com qual outra classe ela compartilha estado, e o que especificamente é compartilhado.</em>
 </p>
+
+A mesma página também renderiza a divisão em si. Alternar **Preview decoupled view** troca os métodos próprios da god class pelas classes propostas e re-roteia as arestas no lugar — a mudança de ligação, não um diagrama redesenhado:
+
+| Antes — a god class hoje | Depois — Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-before.png" alt="DECOUPLE.html antes do toggle: um único nó central MainWindow com seus próprios métodos espalhados ao redor" width="440"> | <img src="../decouple-after.png" alt="DECOUPLE.html depois do toggle: o mesmo nó reduzido a 5 classes propostas em forma de losango, arestas verdes tracejadas mostrando quais métodos foram extraídos para cada uma, e arestas vermelhas mostrando o estado de instância compartilhado entre duas delas" width="440"> |
+| Um nó contendo 47 de seus próprios métodos, cada um alcançável apenas através da classe. | As classes propostas. Verde tracejado = o que foi extraído para cada uma; vermelho = o estado de instância que duas delas ainda compartilham, que é exatamente o que decide entre `split` e `keep_as_is`. Só são desenhados os candidatos que passam do limiar de risco — aqui 5 de 6, e por isso um método fica sem losango onde pousar. |
 
 O `graphify decouple` encontra god objects e diz se dividi-los realmente vale a pena — não apenas que eles são grandes.
 

@@ -100,8 +100,15 @@ Shortest path (3 hops):
   <img src="../decouple-screenshot.svg" alt="DECOUPLE.html:MainWindow 提议拆分出的 5 个类,Node Info 面板打开在 Main Window Axis and Range Controls 上,显示与 Main Window Controller Core 之间有 0.608 的状态重叠" width="900">
 </p>
 <p align="center">
-  <em>在真实项目(AutoCheck/Touchstone Explorer)上运行得到的 DECOUPLE.html——点击任意一个提议的类,就能准确看到它与哪个类共享状态,以及具体共享了什么。</em>
+  <em>在真实项目上运行得到的 DECOUPLE.html——点击任意一个提议的类,就能准确看到它与哪个类共享状态,以及具体共享了什么。</em>
 </p>
+
+同一个页面也会直接画出拆分本身。切换 **Preview decoupled view** 会把神级类自己的方法换成提议的类,并就地重新接线——你看到的是接线的变化,而不是另外画一张图:
+
+| 拆分前——今天的神级类 | 拆分后——Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-before.png" alt="切换前的 DECOUPLE.html:单个 MainWindow 枢纽节点,自己的方法向四周展开" width="440"> | <img src="../decouple-after.png" alt="切换后的 DECOUPLE.html:同一个节点缩成 5 个菱形的提议类,绿色虚线表示哪些方法被抽取到各个类,红色线表示其中两个类仍共享的实例状态" width="440"> |
+| 一个节点里放着自己的 47 个方法,每一个都只能通过这个类才能访问。 | 提议的类。绿色虚线 = 哪些东西被抽取到各个类;红色 = 其中两个类仍然共享的实例状态,而这正是决定 `split` 还是 `keep_as_is` 的关键。只有通过风险阈值的候选才会被画出来——这里是 6 个里的 5 个,所以有一个方法没有对应的菱形可以落脚。 |
 
 `graphify decouple` 会找出神级对象,并告诉你拆分它们是否真的值得——而不只是告诉你它们"很大"。
 
