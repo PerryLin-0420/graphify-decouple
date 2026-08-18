@@ -93,6 +93,32 @@ def _build_graph():
     g.add_node("tangledcaller", label="tangledcaller()", file_type="code", source_file="ext.py", source_location="L1")
     g.add_edge("tangledcaller", "tangled", relation="calls", confidence="EXTRACTED")
 
+    # --- god_object with a DELEGATING split: "PipelineClass" — identical to
+    # TangledClass (same member/group/straddler shape) EXCEPT there is no
+    # reverse edge: group A calls into group B, never the other way. This
+    # isolates the group_dependency_shape effect — same cross_group_edges
+    # count and same straddling_callers as "tangled", only the direction
+    # differs, so any score difference between the two is attributable to
+    # the dag/cyclic discount alone.
+    g.add_node("pipeline", label="PipelineClass", file_type="code", source_file="pipeline.py", source_location="L1")
+    for i in range(3):
+        _add_member(g, "pipeline", f"p{i}", label=f".p{i}()", source_file="pipeline.py")
+    for i in range(3, 6):
+        _add_member(g, "pipeline", f"p{i}", label=f".p{i}()", source_file="pipeline.py")
+    g.add_edge("p0", "p3", relation="calls", confidence="EXTRACTED")
+    g.add_edge("p1", "p4", relation="calls", confidence="EXTRACTED")
+    g.add_edge("p2", "p5", relation="calls", confidence="EXTRACTED")
+    # a 4th forward edge (still group A -> group B, same direction) so the
+    # total cross_group_edges count matches "tangled"'s 4 exactly, isolating
+    # direction as the only variable between the two fixtures.
+    g.add_edge("p0", "p4", relation="calls", confidence="EXTRACTED")
+    for i in range(3):
+        g.add_node(f"pext{i}", label=f"pext{i}()", file_type="code", source_file="ext.py", source_location="L1")
+        g.add_edge(f"pext{i}", "p0", relation="calls", confidence="EXTRACTED")
+        g.add_edge(f"pext{i}", "p4", relation="calls", confidence="EXTRACTED")
+    g.add_node("pipelinecaller", label="pipelinecaller()", file_type="code", source_file="ext.py", source_location="L1")
+    g.add_edge("pipelinecaller", "pipeline", relation="calls", confidence="EXTRACTED")
+
     return g
 
 
@@ -106,6 +132,8 @@ def _communities_for(g):
         2: ["b0", "b1", "b2", "b3", "b4"],
         3: ["t0", "t1", "t2"],
         4: ["t3", "t4", "t5"],
+        5: ["p0", "p1", "p2"],
+        6: ["p3", "p4", "p5"],
     }
 
 
@@ -216,6 +244,30 @@ def test_split_risk_score_zero_for_clean_separation():
     assert split["cross_group_edges"] == 0
     assert split["straddling_callers"] == 0
     assert split["score"] < 5.0
+
+
+def test_split_risk_score_discounts_dag_shaped_cross_group_edges():
+    """"pipeline" and "tangled" are structurally identical (same edge count,
+    same straddling callers) except "pipeline" has no reverse edge between
+    its two groups — group A calls into group B, never back. That is the
+    delegating/pipeline shape (a large orchestrator whose members fan out
+    into worker groups it calls one-way), and it must score strictly lower
+    than the mutually-coupled "tangled" split even though both report the
+    same cross_group_edges and straddling_callers counts."""
+    g = _build_graph()
+    communities = _communities_for(g)
+
+    tangled_groups = candidate_groups(g, member_ids(g, "tangled"), communities, min_group_size=3)
+    tangled = split_risk_score(g, "tangled", tangled_groups)
+
+    pipeline_groups = candidate_groups(g, member_ids(g, "pipeline"), communities, min_group_size=3)
+    pipeline = split_risk_score(g, "pipeline", pipeline_groups)
+
+    assert pipeline["cross_group_edges"] == tangled["cross_group_edges"]
+    assert pipeline["straddling_callers"] == tangled["straddling_callers"]
+    assert pipeline["group_dependency_shape"] == "dag"
+    assert tangled["group_dependency_shape"] == "cyclic"
+    assert pipeline["score"] < tangled["score"]
 
 
 def test_balance_risk_recommends_split_when_split_risk_is_low():

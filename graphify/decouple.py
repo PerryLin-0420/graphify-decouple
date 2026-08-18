@@ -40,6 +40,7 @@ had been checked.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import networkx as nx
@@ -82,6 +83,117 @@ def member_ids(G: nx.DiGraph, god_id: str, *, extracted_only: bool = False) -> l
     return sorted(ids)
 
 
+# Filename fragments that hint a class exists to move data in/out of the
+# process (parser, DAO, repository, client, loader...) rather than to hold
+# behavior. Used only to shortlist a "data_gateway" node_role — never to
+# override the god_object/cohesive_but_large/over_referenced_hub
+# classification, which stays purely structural. Matched as whole PATH
+# TOKENS (see `_path_tokens`), not substrings — a short, common hint like
+# "io" must not false-positive on an unrelated filename that merely
+# contains those letters in sequence (e.g. "distribution_dialog.py").
+_DATA_GATEWAY_PATH_HINTS = frozenset({
+    "parser", "parse", "loader", "loading", "dao", "repository", "gateway",
+    "client", "reader", "writer", "ingest", "importer", "exporter", "io",
+})
+
+_PATH_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _path_tokens(source_file: str) -> set[str]:
+    """Lowercase alnum tokens split on any non-alnum separator (path
+    separators, underscores, hyphens, dots) — e.g.
+    'app/parser/touchstone_parser.py' -> {'app','parser','touchstone','py'}.
+    Token-exact matching only works for the dominant snake_case/kebab-case
+    filename convention; an unseparated compound name like 'dataloader.py'
+    stays one token and will not match the 'loader' hint — an accepted
+    false-negative in exchange for not false-positiving on substrings."""
+    return set(_PATH_TOKEN_RE.findall(source_file.lower()))
+
+
+def _classify_node_role(
+    G: nx.DiGraph,
+    node_id: str,
+    members: list[str],
+    *,
+    project_root: "str | None" = None,
+) -> dict[str, Any]:
+    """Role hint for a god-node candidate, computed the SAME way regardless
+    of whether it structurally classified as god_object, cohesive_but_large,
+    or over_referenced_hub — the role is about WHAT the node is for, which is
+    orthogonal to whether its own members happen to span multiple
+    communities. A data-access class can just as easily land in god_object
+    (many accessor methods, incidentally split across communities — see
+    "data_gateway" below) as in over_referenced_hub (few members, mostly
+    referenced): checking role only inside one structural bucket would miss
+    the other.
+
+    - "tool_function": a plain function (`_callable_class` not set — not a
+      class at all) called from several unrelated files. It is already the
+      single shared implementation; adding per-consumer facades would mean
+      DUPLICATING it, the opposite of consolidation. The applicable check is
+      whether near-duplicate reimplementations exist elsewhere in the
+      codebase — a separate, corpus-wide similarity scan, not run here.
+    - "data_gateway": a class whose own filename reads as a data ingress/
+      egress point (parser/loader/DAO/repository/client/...). Splitting or
+      narrowing ITS interface does not address the real risk: other code
+      bypassing it and touching the same underlying resource directly. That
+      bypass is invisible to a same-file/degree check, and the call graph
+      itself may not capture it (e.g. a module-level alias like
+      `parse_x = parse_y` is not resolved to a call edge in every extractor
+      path) — so this role is a shortlist for manual review, not a verified
+      finding. A "god_object" data_gateway additionally gets a
+      `role_caveat` (see `decouple_plan`) warning that a clean-looking split
+      score does not mean the split addresses the actual risk for this role.
+
+    Anything else stays "generic" — `hub_suggestion` keeps its original text,
+    and god_object/cohesive_but_large entries get no extra caveat.
+    """
+    is_class = bool(G.nodes[node_id].get("_callable_class"))
+    source_file = str(G.nodes[node_id].get("source_file") or "")
+
+    caller_files = {
+        G.nodes[u].get("source_file")
+        for u, _v, data in G.in_edges(node_id, data=True)
+        if data.get("relation") not in MEMBER_RELATIONS
+    }
+    caller_files.discard(source_file)
+    caller_files.discard(None)
+    caller_files.discard("")
+
+    if not is_class:
+        if len(caller_files) >= 3:
+            return {"role": "tool_function", "distinct_caller_files": len(caller_files)}
+        return {"role": "generic"}
+
+    if not _path_tokens(source_file) & _DATA_GATEWAY_PATH_HINTS:
+        return {"role": "generic"}
+
+    read_ratio = None
+    state_analysis = "skipped (no project_root given, unsupported language, or source unreadable)"
+    if project_root and members:
+        from pathlib import Path as _Path
+
+        from graphify.state_affinity import extract_method_attribute_usage
+
+        label = str(G.nodes[node_id].get("label", node_id))
+        member_labels = [G.nodes[m].get("label", m) for m in members]
+        abs_source = str(_Path(project_root) / source_file)
+        usage = extract_method_attribute_usage(abs_source, label, member_labels)
+        if usage:
+            reads = sum(len(u["reads"]) for u in usage.values())
+            writes = sum(len(u["writes"]) for u in usage.values())
+            if reads + writes:
+                read_ratio = round(reads / (reads + writes), 3)
+                state_analysis = "ok"
+
+    return {
+        "role": "data_gateway",
+        "distinct_caller_files": len(caller_files),
+        "read_ratio": read_ratio,
+        "state_analysis": state_analysis,
+    }
+
+
 def classify_god_node(
     G: nx.DiGraph,
     node_id: str,
@@ -90,6 +202,7 @@ def classify_god_node(
     extracted_only: bool = False,
     member_ratio_threshold: float = 0.2,
     min_communities_for_split: int = 2,
+    project_root: "str | None" = None,
 ) -> dict[str, Any]:
     """Classify why `node_id` is a god node.
 
@@ -100,6 +213,16 @@ def classify_god_node(
     - "over_referenced_hub": few/no own members relative to total degree ->
       the coupling is inbound (afferent), not internal responsibility bloat;
       splitting the class body would not reduce coupling.
+
+    Every entry, regardless of which of the three above it lands in, also
+    gets a `node_role` (see `_classify_node_role`) narrowing "what this node
+    is for" into "tool_function", "data_gateway", or "generic" — computed
+    independently of the structural classification, since a data-access
+    class can land in god_object just as easily as in over_referenced_hub.
+    `hub_suggestion` uses it for over_referenced_hub entries; `decouple_plan`
+    uses it to attach a `role_caveat` to god_object entries. `project_root`,
+    when given, lets a "data_gateway" candidate be corroborated against its
+    own members' read/write profile via `graphify.state_affinity`.
     """
     members = member_ids(G, node_id, extracted_only=extracted_only)
     afferent = G.in_degree(node_id)
@@ -119,7 +242,7 @@ def classify_god_node(
     else:
         classification = "over_referenced_hub"
 
-    return {
+    result = {
         "id": node_id,
         "label": G.nodes[node_id].get("label", node_id),
         "source_file": G.nodes[node_id].get("source_file", ""),
@@ -130,7 +253,9 @@ def classify_god_node(
         "distinct_member_communities": distinct,
         "classification": classification,
         "members": members,
+        "node_role": _classify_node_role(G, node_id, members, project_root=project_root),
     }
+    return result
 
 
 def _name_group(
@@ -244,6 +369,9 @@ _RISK_FRAGMENTATION_CAP = 5    # distinct_member_communities >= this maxes "frag
 _SPLIT_EDGE_CAP = 10           # new cross-group edges >= this maxes the "new coupling" component
 _SPLIT_GROUP_CAP = 5           # new classes - 1 >= this maxes the "group overhead" component
 _STATE_OVERLAP_ADD_WEIGHT = 0.6  # extra risk points ADDED (not blended) at 100% state overlap
+_ACYCLIC_EDGE_DISCOUNT = 0.5   # halves the cross-group-edge component when proposed groups'
+                               # dependencies form a DAG (delegating/pipeline) instead of a
+                               # cycle — see split_risk_score's "group_dependency_shape"
 
 
 def original_risk_score(entry: dict[str, Any]) -> float:
@@ -312,16 +440,39 @@ def split_risk_score(
     - `cross_group_edges`: calls/references between members that end up in
       DIFFERENT proposed groups. Today these are invisible intra-class edges;
       after extraction they become new, explicit inter-class dependencies.
+      Weighted by `group_dependency_shape` (below) before it enters the
+      score — a purely one-directional fan of these edges is a materially
+      cheaper shape than the same count split across both directions.
+    - `group_dependency_shape`: "dag" when the proposed groups' cross-group
+      edges, collapsed to one node per group, form NO cycle — i.e. every
+      dependency between two proposed groups runs the same way (group A
+      calls into group B, never the reverse). This is the delegating/
+      pipeline shape (a large orchestrator whose own computation is thin but
+      whose members fan out into worker/stage groups it calls one-way) —
+      after extraction it needs only a one-directional reference between the
+      new classes. "cyclic" means at least one pair of groups calls each
+      other (or a longer cycle through 3+ groups) — after extraction that
+      pair needs a back-reference or a mediator between them, a strictly
+      more expensive shape, so it gets NO discount regardless of how "thin"
+      any individual group looks. This is a shape check on THIS split's own
+      edges, not a language- or domain-aware "is this a pipeline" judgment —
+      a "dag" verdict on a single split with only 2 groups is weak evidence
+      either way; it is one signal among several here, not a classification.
     - `straddling_callers`: outside nodes that depend on members from more
       than one proposed group. Today they hold one reference (the original
       class); after extraction they must depend on multiple new classes.
+      NOT discounted by `group_dependency_shape` — a straddling caller pays
+      the same integration cost regardless of which way the groups call
+      each other.
     - `max_state_overlap` (only when `state_overlap` is supplied — see
       `_group_state_overlap` / `graphify.state_affinity`): the worst-case
       share of `self`/`this` state two proposed groups have in common. This
       gets MORE weight than the call-graph terms above: two groups can have
       zero cross-group calls and still both need the same instance state,
       which the call graph cannot see at all — that is the "moved the
-      methods, didn't reduce the coupling" failure mode.
+      methods, didn't reduce the coupling" failure mode. Also NOT discounted
+      by `group_dependency_shape`: shared instance state is a cost whether
+      the calls between the groups are one-way or mutual.
 
     A single non-residual group (nothing left to compare against) has no
     split risk by construction — there is no second class to be coupled to.
@@ -331,6 +482,7 @@ def split_risk_score(
         return {
             "n_new_classes": len(non_residual),
             "cross_group_edges": 0,
+            "group_dependency_shape": "n/a (nothing to compare)",
             "straddling_callers": 0,
             "straddling_caller_labels": [],
             "state_analysis": "n/a (nothing to compare)",
@@ -343,10 +495,22 @@ def split_risk_score(
     all_members = set(member_group)
 
     cross_group_edges = 0
+    group_pairs: set[tuple[int, int]] = set()
     for u, v in G.edges():
         gu, gv = member_group.get(u), member_group.get(v)
         if gu is not None and gv is not None and gu != gv:
             cross_group_edges += 1
+            group_pairs.add((gu, gv))
+
+    # Collapse the proposed groups to one node each and check whether their
+    # mutual dependencies form a cycle — see the "group_dependency_shape"
+    # entry in this function's docstring for what "dag" vs "cyclic" means
+    # and why only "dag" gets a discount.
+    group_condensation: nx.DiGraph = nx.DiGraph()
+    group_condensation.add_nodes_from(range(len(non_residual)))
+    group_condensation.add_edges_from(group_pairs)
+    is_dag = nx.is_directed_acyclic_graph(group_condensation)
+    group_dependency_shape = "dag" if is_dag else "cyclic"
 
     caller_groups: dict[str, set[int]] = {}
     for u, v in G.edges():
@@ -361,6 +525,8 @@ def split_risk_score(
 
     total_callers = len(caller_groups) or 1
     edge_component = min(cross_group_edges / _SPLIT_EDGE_CAP, 1.0)
+    if is_dag:
+        edge_component *= _ACYCLIC_EDGE_DISCOUNT
     straddle_component = min(len(straddlers) / total_callers, 1.0)
     group_overhead = min((len(non_residual) - 1) / _SPLIT_GROUP_CAP, 1.0)
 
@@ -386,6 +552,7 @@ def split_risk_score(
     return {
         "n_new_classes": len(non_residual),
         "cross_group_edges": cross_group_edges,
+        "group_dependency_shape": group_dependency_shape,
         "straddling_callers": len(straddlers),
         "straddling_caller_labels": [G.nodes[c].get("label", c) for c in straddlers[:8]],
         "state_analysis": state_analysis,
@@ -418,18 +585,80 @@ def balance_risk(
     }
 
 
-def hub_suggestion(G: nx.DiGraph, node_id: str, *, sample_size: int = 8) -> dict[str, Any]:
+def _data_gateway_rationale(node_role: dict[str, Any]) -> str:
+    """Shared wording for a "data_gateway" node_role — used by both
+    `hub_suggestion` (over_referenced_hub) and `decouple_plan`'s
+    `role_caveat` (god_object), so the same warning doesn't drift into two
+    different texts depending on which structural bucket the node landed in."""
+    if node_role.get("state_analysis") == "ok":
+        state_note = f"own members are read-heavy (read_ratio={node_role.get('read_ratio')}), consistent with a data-access class"
+    else:
+        state_note = f"member read/write profile not checked ({node_role.get('state_analysis')})"
+    return (
+        "This class's filename and role look like a data ingress/egress point "
+        f"(parser/loader/DAO/repository/client) — {state_note}. A clean-looking "
+        "coupling score does not mean the real risk is addressed: other code "
+        "bypassing this class and touching the same underlying resource (file, "
+        "table, endpoint) directly, which fragments where that data can be "
+        "validated or changed. Check other call sites into this file's "
+        "lower-level read/parse/write functions for direct access that skips "
+        "this class — that check is call-graph-based and can miss aliased "
+        "re-exports (e.g. `f = other_module.g`)."
+    )
+
+
+def hub_suggestion(
+    G: nx.DiGraph,
+    node_id: str,
+    *,
+    node_role: "dict[str, Any] | None" = None,
+    sample_size: int = 8,
+) -> dict[str, Any]:
     """Suggestion for an over-referenced hub: not a split candidate. Splitting
-    its body would not reduce coupling because the coupling is inbound."""
+    its body would not reduce coupling because the coupling is inbound.
+
+    `node_role` (from `classify_god_node`, see `_classify_node_role`) swaps in
+    role-specific advice for two shapes where the generic "narrow the
+    interface / add per-consumer facades" text is backwards: an
+    already-shared plain function ("tool_function") and a data ingress/
+    egress class ("data_gateway"). Omitted or "generic" keeps the original
+    text — callers using this function directly, outside `decouple_plan`,
+    see unchanged behavior.
+    """
     callers = sorted(G.predecessors(node_id), key=lambda n: (-G.degree(n), str(n)))[:sample_size]
-    return {
-        "recommendation": "interface_segregation",
-        "rationale": (
+    role = (node_role or {}).get("role", "generic")
+
+    if role == "tool_function":
+        recommendation = "keep_centralized"
+        rationale = (
+            "This is a plain function (not a class), already called from "
+            f"{node_role.get('distinct_caller_files')} different files — it is "
+            "already the single shared implementation, not a fragmented one. "
+            "Narrowing its interface or adding per-consumer facades would mean "
+            "DUPLICATING it, the opposite of consolidation. The applicable check "
+            "is whether near-duplicate reimplementations of the same logic exist "
+            "elsewhere in the codebase (a separate, corpus-wide similarity scan — "
+            "not run as part of this report)."
+        )
+    elif role == "data_gateway":
+        recommendation = "verify_single_entry_point"
+        rationale = (
+            "Extract-Class on ITS body would not address the real risk here: "
+            + _data_gateway_rationale(node_role)
+        )
+    else:
+        recommendation = "interface_segregation"
+        rationale = (
             "Most of this node's edges are incoming references from other parts of "
             "the codebase, not its own methods/members. Extract-Class would not "
             "reduce coupling here; consider narrowing its public interface or "
             "introducing per-consumer facades instead."
-        ),
+        )
+
+    return {
+        "recommendation": recommendation,
+        "role": role,
+        "rationale": rationale,
         "sample_dependents": [
             {"id": c, "label": G.nodes[c].get("label", c)} for c in callers
         ],
@@ -478,6 +707,7 @@ def decouple_plan(
             extracted_only=extracted_only,
             member_ratio_threshold=member_ratio_threshold,
             min_communities_for_split=min_communities_for_split,
+            project_root=project_root,
         )
         if info["classification"] == "god_object":
             groups = candidate_groups(
@@ -494,8 +724,17 @@ def decouple_plan(
             overlap = _group_state_overlap(abs_source, info["label"], non_residual)
             split = split_risk_score(G, node_id, groups, state_overlap=overlap)
             info["risk"] = balance_risk(risk_before, split, net_benefit_threshold=net_benefit_threshold)
+            if info.get("node_role", {}).get("role") == "data_gateway":
+                # The split verdict above scores cross-group coupling only —
+                # it says nothing about whether extracting accessor methods
+                # off a data-access class is even the right move for this
+                # role (see _classify_node_role). Attached regardless of
+                # "split"/"marginal"/"keep_as_is": every one of those
+                # verdicts is answering a different question than "is this
+                # class's data being accessed from a single place".
+                info["role_caveat"] = _data_gateway_rationale(info["node_role"])
         elif info["classification"] == "over_referenced_hub":
-            info["hub_suggestion"] = hub_suggestion(G, node_id)
+            info["hub_suggestion"] = hub_suggestion(G, node_id, node_role=info.get("node_role"))
         entries.append(info)
 
     return {
@@ -535,6 +774,25 @@ def decouple_plan(
             "that entry (no project_root given, unsupported language, or the source "
             "file could not be read/parsed) — it is an unknown, not a verified zero. "
             "Its recommendation rests on the call-graph terms alone.",
+            "node_role ('tool_function'/'data_gateway'/'generic', see "
+            "_classify_node_role) is a filename- and shape-based HINT, computed "
+            "the same way regardless of classification, not a verified finding — "
+            "in particular, 'data_gateway' bypass risk is call-graph-based and "
+            "can miss a bypass hidden behind a module-level alias (e.g. "
+            "`f = other_module.g`), which some extractor paths do not resolve to "
+            "a call edge at all. A god_object entry with node_role=='data_gateway' "
+            "gets a role_caveat alongside its split verdict — the two answer "
+            "different questions (split coupling cost vs. single-entry-point "
+            "risk) and neither one overrides the other.",
+            "group_dependency_shape == 'dag' halves the cross-group-edge "
+            "component of split_risk_score (a fixed 0.5 factor, not a "
+            "validated constant) on the theory that a purely one-directional "
+            "dependency between two proposed groups is cheaper than a mutual "
+            "one — see split_risk_score's docstring. This is a shape check on "
+            "the proposed split's own edges, not a semantic 'is this a "
+            "pipeline' judgment, and a 2-group split is weak evidence either "
+            "way; straddling_callers and max_state_overlap are NOT discounted "
+            "by it.",
         ],
     }
 
@@ -714,7 +972,9 @@ def render_markdown(plan: dict[str, Any]) -> str:
         "",
     ]
     for entry in plan["god_nodes"]:
-        lines.append(f"## `{entry['label']}` — {entry['classification']}")
+        node_role = entry.get("node_role", {}).get("role", "generic")
+        role_suffix = f" ({node_role})" if node_role != "generic" else ""
+        lines.append(f"## `{entry['label']}` — {entry['classification']}{role_suffix}")
         lines.append(f"- source: `{entry['source_file']}`")
         lines.append(
             f"- afferent={entry['afferent']} efferent={entry['efferent']} "
@@ -727,10 +987,13 @@ def render_markdown(plan: dict[str, Any]) -> str:
                 f"- risk_before={risk.get('risk_before')} risk_after={risk.get('risk_after')} "
                 f"net_benefit={risk.get('net_benefit')} -> **{risk.get('recommendation')}**"
             )
+            if entry.get("role_caveat"):
+                lines.append(f"  - **role caveat ({node_role}):** {entry['role_caveat']}")
             if sd.get("n_new_classes"):
                 lines.append(
                     f"  - would create {sd['n_new_classes']} new classes; "
-                    f"{sd['cross_group_edges']} cross-group edges introduced; "
+                    f"{sd['cross_group_edges']} cross-group edges introduced "
+                    f"({sd.get('group_dependency_shape')}); "
                     f"{sd['straddling_callers']} caller(s) would depend on more than one new class"
                 )
                 if sd.get("state_analysis") == "ok":
