@@ -82,8 +82,8 @@ const hyperedges = {hyperedges_json};
 // matching how a cluster-plot ellipse sits behind its points.
 network.on('beforeDrawing', function(ctx) {{
     hyperedges.forEach(h => {{
-        // No `layer` at all = a pre-existing semantic hyperedge (not from
-        // decouple) — always drawn. A tagged layer is gated by its checkbox.
+        // A tagged layer (graphify.decouple's own hulls) is gated by its
+        // checkbox.
         if (h.layer && typeof HULL_LAYERS_VISIBLE !== 'undefined' && !HULL_LAYERS_VISIBLE[h.layer]) return;
         // Explicit geometry (graphify.decouple's class discs, which were
         // computed to be provably non-overlapping) wins over fitting a
@@ -94,6 +94,24 @@ network.on('beforeDrawing', function(ctx) {{
             drawRegion(ctx, h, h.cx, h.cy, h.r, h.r, 0);
             return;
         }}
+        // A pre-existing semantic hyperedge (no `layer` — e.g. a
+        // README-derived feature grouping, unrelated to decouple) fits an
+        // ellipse to wherever its member nodes CURRENTLY sit. That design
+        // assumes physics naturally clustered related nodes close
+        // together — true when nothing else is repositioning them. Once
+        // "Class boundaries" pins every class to its own explicit,
+        // deliberately-spread-apart disc (see decouple._class_cluster_layout),
+        // a hyperedge spanning members from several different classes gets
+        // its nodes yanked far apart for a reason that has nothing to do
+        // with the hyperedge's own meaning — the fit then has to stretch to
+        // cover them and produces an ellipse dwarfing every real region
+        // (measured on a real corpus: a 4-node hyperedge whose members
+        // happened to land in 2 different class discs fit to roughly
+        // 5000x6000 units, next to real class regions maxing out around
+        // 800). Skipped while that layout is active, not resized — there is
+        // no size that makes "these nodes are pinned apart on purpose"
+        // read as "these nodes are naturally close together".
+        if (!h.layer && typeof HULL_LAYERS_VISIBLE !== 'undefined' && HULL_LAYERS_VISIBLE.class) return;
         const positions = h.nodes
             .map(nid => network.getPositions([nid])[nid])
             .filter(p => p !== undefined);
