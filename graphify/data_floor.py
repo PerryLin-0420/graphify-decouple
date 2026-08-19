@@ -38,6 +38,30 @@ true data direction would need dataflow analysis this module does not
 attempt. Call direction is the only direction available, and "longest
 path" is meaningless without one to be long ALONG.
 
+Only edges that represent actual runtime structure count, and they are
+WEIGHTED — see `_HOP_COST`. graphify's graph also carries edges like
+`rationale_for` (a docstring node documenting a symbol), `contains` (file
+lists symbol), `imports`, `references`, `inherits`,
+`conceptually_related_to`: none of these is a runtime relationship, and
+counting them manufactures fake depth. Measured on a real corpus: every
+`_rationale_N` docstring node attached to a deep symbol via `rationale_for`
+inherited that symbol's floor plus one, purely from being documented — not
+from doing anything at that depth itself — which pushed the tallest floor
+past 20 for no structural reason.
+
+`method` edges are the reason costs exist rather than a flat one-floor-per-
+edge rule. A `method` edge is CONTAINMENT ("class C has method m"): C and m
+are two granularities of one unit, so the hop costs ZERO floors — otherwise
+a class reads as sitting one floor below its own `__init__`, and (measured
+on the same corpus) a class disc lands on a different floor from its own
+members, leaving floors populated by stray member points and no class at
+all. It cannot merely be dropped either, because real chains route THROUGH
+a class node (`_build_ui() --calls--> FilesPanel --method--> .set_sources()`);
+removing it disconnects the chain and costs real coverage (41% -> 29%).
+Zero cost keeps the chain intact while charging nothing for the detour: on
+that corpus the tallest floor fell from 10 to 7, and the 3 floors removed
+were exactly the 3 `method` hops in the deepest chain.
+
 Honest limits:
   - Boundary detection is a NAME heuristic (path tokens + symbol-name
     patterns), not I/O detection. It cannot see a class that does raw
@@ -47,8 +71,12 @@ Honest limits:
     taken on faith.
   - A graph with no detectable boundary yields NO floors at all (an empty
     dict), not a fabricated layering rooted at an arbitrary node.
-  - Nodes in a component with no boundary node reachable INTO them are
-    absent from the result — unreachable, not floor 0.
+  - Nodes in a component with no boundary node reachable INTO them via a
+    call-shaped edge are absent from the result — unreachable, not floor 0.
+    This includes a node whose ONLY edges are non-call ones (a rationale
+    node with nothing but a `rationale_for` edge, a file-level `contains`
+    leaf) — it is not "at the boundary" just because it has no distance to
+    measure.
   - A boundary node's own floor is fixed at 0 even if some OTHER, longer
     chain also happens to reach it — being an I/O boundary is what floor 0
     MEANS, not a distance to be second-guessed by a path through something
@@ -110,6 +138,49 @@ _BOUNDARY_NAME_TOKENS = frozenset({
     "reader", "writer", "stream", "file", "socket",
 })
 
+# How many floors each kind of edge is worth. Only edges listed here take
+# part in the layering at all; graphify's graph also carries `contains`
+# (file lists symbol), `rationale_for` (docstring documents symbol),
+# `imports`/`imports_from`, `references`, `inherits`, `shares_data_with`,
+# `uses`, `conceptually_related_to`, `semantically_similar_to` — none of
+# those is a runtime relationship between two units of behavior, and
+# counting one manufactures depth out of documentation or file layout.
+#
+# `method` is included but costs ZERO floors, which is the whole point of
+# having costs at all. A `method` edge is CONTAINMENT ("class C has method
+# m"), not invocation, so C and m are two granularities of one unit, not
+# two stages of a data flow — charging a floor for that hop says "MainWindow
+# sits one floor deeper than its own __init__", which is meaningless. But
+# it cannot simply be dropped either: real chains route THROUGH a class
+# node (`_build_ui() --calls--> FilesPanel --method--> .set_sources()`), so
+# removing it disconnects the chain and the downstream half loses its floor
+# entirely (measured on a real corpus: floor coverage fell 41% -> 29%).
+# Zero cost keeps the chain connected while charging nothing for the
+# detour — on that same corpus it cut the tallest floor from 10 to 7, and
+# the 3 floors it removed were exactly the 3 `method` hops in the deepest
+# chain.
+_HOP_COST: dict[str, int] = {"calls": 1, "indirect_call": 1, "method": 0}
+
+
+def _call_structure_only(G: nx.DiGraph) -> nx.DiGraph:
+    """`G` restricted to the edges in `_HOP_COST`, all nodes kept, each
+    edge carrying its floor cost as a `cost` attribute.
+
+    A node whose only edges are excluded ones (a rationale node with
+    nothing but a `rationale_for` edge, a symbol reachable only via
+    `contains`) ends up with no edges here — same outcome as never being
+    connected to the call graph at all, which is what it actually is for
+    this purpose.
+    """
+    H = nx.DiGraph()
+    H.add_nodes_from(G.nodes(data=True))
+    for u, v, data in G.edges(data=True):
+        cost = _HOP_COST.get(data.get("relation"))
+        if cost is not None:
+            H.add_edge(u, v, cost=cost)
+    return H
+
+
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -150,10 +221,17 @@ def compute_floors(G: "nx.DiGraph") -> "tuple[dict[str, int], dict[str, str]]":
     see the module docstring for why longest (not shortest) and why the
     condensation (cycles have no longest path otherwise).
 
+    Hops are WEIGHTED by `_HOP_COST`, not counted flat: an invocation costs
+    one floor, a `method` containment edge costs zero (see the module
+    docstring).
+
     Returns `(floors, boundary_reasons)`. `floors` maps node id -> floor;
-    a node in an SCC with no boundary node reachable into it is ABSENT
-    (unknown floor), never defaulted to 0. `boundary_reasons` maps each
-    floor-0 node to the `boundary_reason` that put it there.
+    a node in an SCC with no boundary node reachable into it over an edge
+    in `_HOP_COST` is ABSENT (unknown floor), never defaulted to 0 — this
+    includes a node whose only edges are excluded ones (documentation,
+    imports, file containment), which has no more of a real position in the
+    call structure than one with no edges at all. `boundary_reasons` maps
+    each floor-0 node to the `boundary_reason` that put it there.
 
     Deterministic: `nx.condensation`'s SCC numbering only depends on `G`'s
     own (insertion-ordered) structure, and every set this function iterates
@@ -172,20 +250,41 @@ def compute_floors(G: "nx.DiGraph") -> "tuple[dict[str, int], dict[str, str]]":
     if not reasons:
         return {}, {}
 
-    # Condensed on the REVERSED graph, not G itself: a call edge (u, v)
-    # means "u calls v", i.e. v is closer to the boundary than u is (u is
-    # the one downstream, consuming whatever v produces). Floor must
+    # Propagated over call-shaped edges only (see _call_structure_only) —
+    # boundary detection above still looks at every node's own attributes,
+    # regardless of what kind of edges connect it, but a hop only counts
+    # when it is an actual invocation.
+    call_graph = _call_structure_only(G)
+
+    # Condensed on the REVERSED graph, not call_graph itself: a call edge
+    # (u, v) means "u calls v", i.e. v is closer to the boundary than u is
+    # (u is the one downstream, consuming whatever v produces). Floor must
     # increase walking from a boundary node OUT TO ITS CALLERS, which is
-    # the successor direction on G.reverse(), not on G — reversing first
-    # lets the same forward topological-sort/relax loop below do the
-    # right thing. SCC membership is identical either way (a cycle is a
-    # cycle regardless of which way it's read), so this doesn't change
-    # which nodes get condensed together, only which way floors flow.
-    condensation = nx.condensation(G.reverse(copy=False))
+    # the successor direction on the reversed graph, not the original —
+    # reversing first lets the same forward topological-sort/relax loop
+    # below do the right thing. SCC membership is identical either way (a
+    # cycle is a cycle regardless of which way it's read), so this doesn't
+    # change which nodes get condensed together, only which way floors flow.
+    condensation = nx.condensation(call_graph.reverse(copy=False))
     node_to_scc: dict[str, int] = condensation.graph["mapping"]
 
     seed_sccs = {node_to_scc[n] for n in reasons}
     floors_scc: dict[int, int] = {s: 0 for s in seed_sccs}
+
+    # Cost of each condensed edge = the MAX cost of any underlying edge
+    # between those two SCCs. When one SCC is reached from another both by
+    # a real call (cost 1) and by containment (cost 0), the call is the hop
+    # that actually moved a floor, so the pair is worth a floor. Built by
+    # walking the underlying edges once and mapping each to its SCC pair —
+    # note the reversal: a `call_graph` edge u -> v ("u calls v") is a
+    # v -> u edge in the condensed, reversed graph the DP walks.
+    scc_edge_cost: dict[tuple[int, int], int] = {}
+    for u, v, data in call_graph.edges(data=True):
+        pair = (node_to_scc[v], node_to_scc[u])
+        if pair[0] == pair[1]:
+            continue  # inside one SCC — no floor difference to charge
+        if data["cost"] > scc_edge_cost.get(pair, -1):
+            scc_edge_cost[pair] = data["cost"]
 
     # nx.condensation is a DAG by construction (SCCs cannot cycle among
     # themselves — if they did, they would BE one SCC), so topological
@@ -200,7 +299,7 @@ def compute_floors(G: "nx.DiGraph") -> "tuple[dict[str, int], dict[str, str]]":
         for succ in sorted(condensation.successors(scc)):
             if succ in seed_sccs:
                 continue  # a boundary SCC's floor is fixed at 0, never overwritten
-            candidate = base + 1
+            candidate = base + scc_edge_cost.get((scc, succ), 1)
             if succ not in floors_scc or candidate > floors_scc[succ]:
                 floors_scc[succ] = candidate
 

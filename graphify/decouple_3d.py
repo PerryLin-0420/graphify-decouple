@@ -124,7 +124,15 @@ def build_floor_scene(
     region_ids = {r["id"] for r in regions}
     links = _aggregate_region_links(G, node_region, region_ids)
 
-    used_floors = sorted({r["floor"] for r in regions})
+    # Every RAW floor number that has something to actually draw there — a
+    # region's own dominant floor, OR any individual member scattered off
+    # onto its own (different) floor — not just the region-dominant set.
+    # A floor with nothing in either category (e.g. only rationale/test
+    # nodes that never resolve to a region member) gets no Z-slot at all,
+    # rather than reserving dead space for a floor nothing ever occupies.
+    used_floors = sorted(
+        {r["floor"] for r in regions} | {m["floor"] for r in regions for m in r["members"]}
+    )
     return {"regions": regions, "links": links, "floors": used_floors, "_node_region": node_region}
 
 
@@ -222,7 +230,12 @@ SCENE.regions.forEach(r => {{
   extent = Math.max(extent, Math.abs(r.x) + r.r, Math.abs(r.y) + r.r);
 }});
 const FLOOR_SPACING = Math.max(extent * 0.55, {_FLOOR_SPACING});
-const floorZ = f => f * FLOOR_SPACING;
+// Z position uses the floor's DENSE RANK (its index among occupied floors),
+// not its raw number — a raw floor 14 sitting right after an occupied
+// floor 10 must not leave 3 floor-spacings of dead air for floors 11-13
+// nothing was ever drawn on. `floor` fields elsewhere (labels, tooltips,
+// checkboxes) keep the raw number; only the Z height is rank-based.
+const floorZ = f => (SCENE.floor_rank[f] || 0) * FLOOR_SPACING;
 
 // ---- build geometry -------------------------------------------------------
 const byFloor = new Map();
@@ -355,7 +368,11 @@ function updateLinkEmphasis() {{
 }}
 
 // ---- camera + inline orbit controls --------------------------------------
-const target = new THREE.Vector3(0, 0, floorZ((SCENE.floors[0] + SCENE.floors[SCENE.floors.length - 1]) / 2));
+// Rank space is dense (0..length-1) regardless of the raw floor numbers
+// involved, so the midpoint rank is just the middle of that range — no
+// need to average raw floor numbers (which could land on an unoccupied,
+// unranked value).
+const target = new THREE.Vector3(0, 0, ((SCENE.floors.length - 1) / 2) * FLOOR_SPACING);
 // Start near side-on (pitch toward PI/2) rather than looking down: the
 // whole point of this view is the vertical stacking, which a top-down
 // default hides completely.
@@ -688,8 +705,18 @@ def write_decouple_3d_html(
 
     after_regions, member_to_after_region = _proposed_group_regions(G, plan, class_discs, cluster_positions, floors)
     payload["regions"].extend(after_regions)
-    if after_regions:
-        payload["floors"] = sorted(set(payload["floors"]) | {r["floor"] for r in after_regions})
+    # Recomputed over ALL regions (before + after), same rule as
+    # build_floor_scene: a floor gets a Z-slot only if something (a
+    # region's own floor, or one of its members') actually lands there.
+    payload["floors"] = sorted(
+        {r["floor"] for r in payload["regions"]}
+        | {m["floor"] for r in payload["regions"] for m in r["members"]}
+    )
+    # Dense rank for the Z axis — collapses gaps between occupied floors
+    # (e.g. raw floors {0,1,...,6,8,10,14,...} become ranks 0,1,...,6,7,8,9,...)
+    # so an unoccupied raw floor number no longer stretches the stack with
+    # empty space nothing was ever going to be drawn in.
+    payload["floor_rank"] = {f: i for i, f in enumerate(payload["floors"])}
 
     # "After" links: the SAME edges, the SAME aggregation
     # (_aggregate_region_links), but every extracted member now resolves to

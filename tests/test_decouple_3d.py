@@ -65,6 +65,54 @@ def _floors_for(g):
     return compute_floors(g)[0]
 
 
+# ── Z-axis floor compaction ──────────────────────────────────────────────────
+
+def test_floor_rank_compacts_gaps_between_occupied_floors(tmp_path):
+    """Floors 2, 3, and 4 exist in the raw graph (a real chain runs through
+    them) but resolve to no region and no rendered member — same as
+    AutoCheck's rationale/test nodes, which have a floor but are never part
+    of any class/module region. Those unoccupied floors must not stretch
+    the Z axis: `floors`/`floor_rank` should list and rank only 0, 1, 5 —
+    dense, with no reserved slot for the empty ones in between."""
+    g = nx.DiGraph()
+    _code(g, "loader", "Loader", "app/io/loader.py", _callable_class=True)  # floor 0, a boundary
+    _code(g, "loader_m", ".load()", "app/io/loader.py")
+    g.add_edge("loader", "loader_m", relation="method", confidence="EXTRACTED")
+
+    _code(g, "near", "Near", "app/ui/near.py", _callable_class=True)
+    _code(g, "near_m", ".m()", "app/ui/near.py")
+    g.add_edge("near", "near_m", relation="method", confidence="EXTRACTED")
+    g.add_edge("near_m", "loader_m", relation="calls", confidence="EXTRACTED")  # floor 1
+
+    # A real chain through nodes that never resolve into any region (they
+    # are "rationale", not code) — floors 2, 3, 4 are genuine but nothing
+    # ever gets drawn there.
+    g.add_node("r2", label="r2", file_type="rationale", source_file="docs/r2.md")
+    g.add_node("r3", label="r3", file_type="rationale", source_file="docs/r3.md")
+    g.add_node("r4", label="r4", file_type="rationale", source_file="docs/r4.md")
+    g.add_edge("r2", "near_m", relation="calls")
+    g.add_edge("r3", "r2", relation="calls")
+    g.add_edge("r4", "r3", relation="calls")
+
+    _code(g, "far", "Far", "app/ui/far.py", _callable_class=True)
+    _code(g, "far_m", ".m()", "app/ui/far.py")
+    g.add_edge("far", "far_m", relation="method", confidence="EXTRACTED")
+    g.add_edge("far_m", "r4", relation="calls", confidence="EXTRACTED")  # floor 5
+
+    plan = decouple_plan(g, {}, top_n=20, min_group_size=1)
+    out = tmp_path / "DECOUPLE_3D.html"
+    write_decouple_3d_html(g, plan, {}, out)
+    html = out.read_text(encoding="utf-8")
+    import json as _json
+    import re as _re
+    m = _re.search(r"const SCENE = (\{.*?\});\s*\n\nconst view", html, _re.S)
+    assert m, "could not locate the embedded SCENE payload"
+    scene = _json.loads(m.group(1))
+
+    assert scene["floors"] == [0, 1, 5]
+    assert scene["floor_rank"] == {"0": 0, "1": 1, "5": 2}
+
+
 # ── build_floor_scene ────────────────────────────────────────────────────────
 
 def test_build_floor_scene_places_region_on_dominant_floor():
