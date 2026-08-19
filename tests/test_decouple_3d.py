@@ -398,3 +398,40 @@ def test_write_decouple_3d_html_uses_the_plans_floors_without_recomputing(tmp_pa
     monkeypatch.setattr(data_floor, "compute_floors_with_provenance", _boom)
     out = tmp_path / "DECOUPLE_3D.html"
     assert write_decouple_3d_html(g, plan, communities, out) == out
+
+
+def test_a_regions_floor_is_decided_by_its_measured_members_not_its_parallel_ones():
+    """Same rule as data_floor.class_floor_profile, enforced where the
+    region discs are actually placed: a region with 2 members measured at
+    floor 1 and 4 placed alongside floor 0 stays on floor 1. Measured on
+    AutoCheck, three module regions dropped a floor this way — adjacency
+    evidence outvoting call-chain evidence purely on count."""
+    g = _build_graph()
+    positions, discs, region_members = _class_cluster_layout(g)
+    dialog_members = region_members["dialog"]
+    floors = {"dialog": 1}
+    floors.update({m: 1 for m in dialog_members[:2]})
+    floors.update({m: 0 for m in dialog_members[2:]})
+    measured = set(dialog_members[:2])
+    payload = build_floor_scene(
+        g, discs, positions, region_members, floors, COMMUNITY_COLORS, measured=measured,
+    )
+    dialog = next(r for r in payload["regions"] if r["id"] == "dialog")
+    assert dialog["floor"] == 1
+    # Member points still show where each member actually sits.
+    assert {m["floor"] for m in dialog["members"]} == {0, 1}
+
+
+def test_a_region_with_only_parallel_members_is_placed_not_left_unknown(tmp_path):
+    """The other half of the same rule: no measured member at all means the
+    parallel placements ARE the evidence, and the region belongs on that
+    floor rather than on the unknown band."""
+    g = _build_graph()
+    positions, discs, region_members = _class_cluster_layout(g)
+    dialog_members = region_members["dialog"]
+    floors = {m: 3 for m in dialog_members}
+    payload = build_floor_scene(
+        g, discs, positions, region_members, floors, COMMUNITY_COLORS, measured=set(),
+    )
+    dialog = next(r for r in payload["regions"] if r["id"] == "dialog")
+    assert dialog["floor"] == 3

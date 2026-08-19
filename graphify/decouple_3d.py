@@ -66,6 +66,7 @@ def build_floor_scene(
     region_members: dict[str, list[str]],
     floors: dict[str, int],
     community_colors: list[str],
+    measured: "set[str] | None" = None,
 ) -> dict[str, Any]:
     """Assemble the JSON payload the 3D page renders.
 
@@ -84,12 +85,29 @@ def build_floor_scene(
     floor and flagged `spans` with the range — that is the case the whole
     view exists to make visible, so it is marked rather than silently
     flattened.
+
+    `measured` is the set of nodes whose floor was measured along call
+    structure (`data_floor.compute_floors_with_provenance`, everything but
+    the parallel pass), and those decide a region's floor on their own
+    wherever it has any — same rule, same reason, as
+    `data_floor.class_floor_profile`: members placed alongside a neighbor
+    must not outvote members measured from the boundary just by being more
+    numerous. A region with no measured member falls back to its
+    parallel-placed ones instead of the "unknown" band. Individual member
+    POINTS still carry their own floor either way — the scatter should
+    show where each member actually sits.
     """
     regions: list[dict[str, Any]] = []
     for i, region_id in enumerate(sorted(class_discs)):
         cx, cy, radius = class_discs[region_id]
         members = region_members.get(region_id, [])
-        known = [floors[m] for m in [region_id, *members] if m in floors]
+        ids = [region_id, *members]
+        known = [
+            floors[m] for m in ids
+            if m in floors and (measured is None or m in measured)
+        ]
+        if not known:
+            known = [floors[m] for m in ids if m in floors]
         # A region with NO determinable floor is NOT skipped — omitting it
         # here doesn't just leave a class off the stack, it silently drops
         # every link to or from it too (measured on a real corpus: 26 of 69
@@ -777,8 +795,12 @@ def write_decouple_3d_html(
     # have no floor at all. Recomputed only for a caller holding a plan
     # built before `data_floors` existed.
     floor_data = plan.get("data_floors")
+    measured: "set[str] | None" = None
     if floor_data is not None:
         floors = floor_data["floors"]
+        provenance = floor_data.get("provenance")
+        if provenance is not None:
+            measured = {n for n, kind in provenance.items() if kind != "parallel"}
     else:
         from graphify.data_floor import compute_floors
 
@@ -796,7 +818,10 @@ def write_decouple_3d_html(
     if not class_discs:
         return None
 
-    payload = build_floor_scene(G, class_discs, cluster_positions, region_members, floors, COMMUNITY_COLORS)
+    payload = build_floor_scene(
+        G, class_discs, cluster_positions, region_members, floors, COMMUNITY_COLORS,
+        measured=measured,
+    )
     for r in payload["regions"]:
         r["state"] = "before"
     node_region_before = payload.pop("_node_region")

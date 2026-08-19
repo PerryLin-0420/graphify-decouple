@@ -780,6 +780,12 @@ def decouple_plan(
     # entry's floor fields stay absent rather than defaulting to a
     # fabricated layer.
     floors, floor_reasons, floor_provenance = compute_floors_with_provenance(G)
+    # Nodes whose floor was MEASURED along call structure, as opposed to
+    # placed alongside a neighbor by the parallel pass. Every profile below
+    # is decided by these alone wherever a unit has any, so adjacency can
+    # add coverage without ever outvoting a measured floor — see
+    # class_floor_profile.
+    measured_floors = {n for n, kind in floor_provenance.items() if kind != "parallel"}
 
     gods = _god_nodes(G, top_n=top_n)
     entries: list[dict[str, Any]] = []
@@ -792,7 +798,10 @@ def decouple_plan(
             min_communities_for_split=min_communities_for_split,
             project_root=project_root,
         )
-        floor_profile = class_floor_profile(G, node_id, info["members"], floors) if floors else None
+        floor_profile = (
+            class_floor_profile(G, node_id, info["members"], floors, measured=measured_floors)
+            if floors else None
+        )
         if floor_profile:
             info["floor_profile"] = floor_profile
             # Consumed by original_risk_score as an additive term — a class
@@ -814,7 +823,9 @@ def decouple_plan(
             if floors:
                 for g in groups:
                     if g["community_id"] is not None:
-                        g["floor_profile"] = class_floor_profile(G, None, g["members"], floors)
+                        g["floor_profile"] = class_floor_profile(
+                            G, None, g["members"], floors, measured=measured_floors,
+                        )
             info["proposed_groups"] = groups
             risk_before = original_risk_score(info)
             non_residual = [gr for gr in groups if gr["community_id"] is not None]
@@ -861,6 +872,7 @@ def decouple_plan(
             "floors": floors,
             "boundary_reasons": floor_reasons,
             "provenance": floor_provenance,
+            "measured": sorted(measured_floors),
         },
         "caveats": [
             "Member detection uses AST relation edges only (method/contains/defines); "

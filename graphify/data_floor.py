@@ -558,6 +558,7 @@ def class_floor_profile(
     class_id: str,
     members: list[str],
     floors: dict[str, int],
+    measured: "set[str] | None" = None,
 ) -> "dict[str, Any] | None":
     """Which floor(s) a class occupies, and by how much it straddles them.
 
@@ -574,6 +575,20 @@ def class_floor_profile(
     no member (nor the class node itself) has a known floor, rather than
     guessing a layer for it.
 
+    `measured`, when given, is the set of nodes whose floor was MEASURED
+    along call structure (see `compute_floors_with_provenance`: everything
+    but the parallel pass). Those decide this unit's floor on their own,
+    and a unit's parallel-placed members are ignored while even one
+    measured member exists — a floor taken from adjacency must never
+    outvote one taken from a call chain. The real case: a module region
+    with 3 members measured at floor 1 and 5 placed alongside floor 0
+    flipped from floor 1 to floor 0 on the strength of the weaker
+    evidence, purely because there was more of it. Only a unit with NO
+    measured member at all falls back to its parallel-placed ones (that is
+    the coverage the parallel pass exists to add), and says so in
+    `floor_basis`. Pass `measured=None` to treat every known floor as
+    measured — the historical behavior.
+
     `floor_evidence` is the share of this unit's members whose floor is
     actually known (0.0-1.0) — how much of the unit `floor_span` was
     measured over, NOT how confident the boundary heuristic is. It exists
@@ -586,7 +601,16 @@ def class_floor_profile(
     span 0. `cross_floor_risk` scales by this so a span built on two
     isolated points cannot outweigh one measured across a whole class.
     """
-    known = [floors[n] for n in [class_id, *members] if n in floors]
+    ids = [class_id, *members] if class_id is not None else list(members)
+    # Measured evidence first, and alone if there is any of it — see above.
+    known = [
+        floors[n] for n in ids
+        if n in floors and (measured is None or n in measured)
+    ]
+    basis = "measured"
+    if not known:
+        known = [floors[n] for n in ids if n in floors]
+        basis = "parallel"
     if not known:
         return None
     counts: dict[int, int] = {}
@@ -598,6 +622,9 @@ def class_floor_profile(
     total = len(members) + (1 if class_id is not None else 0)
     return {
         "floor": dominant,
+        # "measured" = decided by members placed along call structure;
+        # "parallel" = this unit had none, and sits where its neighbors do.
+        "floor_basis": basis,
         "min_floor": min(known),
         "max_floor": max(known),
         "floor_span": max(known) - min(known),

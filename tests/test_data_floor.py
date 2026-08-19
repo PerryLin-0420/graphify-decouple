@@ -549,3 +549,37 @@ def test_cross_floor_risk_scales_down_when_span_rests_on_few_members():
     assert cross_floor_risk(barely_measured) == 25.0
     # a profile without the field predates the weighting — not silently zeroed
     assert cross_floor_risk({"floor_span": 4}) == 100.0
+
+
+def test_parallel_members_never_outvote_measured_ones_for_a_units_floor():
+    """A unit's floor is a majority vote over its members, so without this
+    rule the weaker evidence wins simply by being more numerous. The real
+    case, on AutoCheck: a module region with 3 members measured at floor 1
+    and 5 placed alongside floor 0 flipped from floor 1 to floor 0 — the
+    parallel pass was supposed to ADD coverage for unplaced units, not
+    restate where already-measured ones live."""
+    g = nx.DiGraph()
+    _code(g, "cls", "Widget", source_file="app/ui/w.py")
+    floors = {"m0": 1, "m1": 1, "m2": 1, "p0": 0, "p1": 0, "p2": 0, "p3": 0, "p4": 0}
+    measured = {"m0", "m1", "m2"}
+    members = ["m0", "m1", "m2", "p0", "p1", "p2", "p3", "p4"]
+    profile = class_floor_profile(g, None, members, floors, measured=measured)
+    assert profile["floor"] == 1  # the 3 measured members, not the 5 parallel ones
+    assert profile["floor_basis"] == "measured"
+    assert profile["members_with_known_floor"] == 3
+    # Without the measured set, the old majority-vote behavior is unchanged.
+    assert class_floor_profile(g, None, members, floors)["floor"] == 0
+
+
+def test_a_unit_with_only_parallel_members_falls_back_to_them():
+    """The coverage the parallel pass exists to add: a unit with NO member
+    measured along call structure is placed where its neighbors are rather
+    than reported as having no floor — and says which kind of evidence
+    that was."""
+    g = nx.DiGraph()
+    floors = {"p0": 2, "p1": 2}
+    profile = class_floor_profile(g, None, ["p0", "p1"], floors, measured=set())
+    assert profile["floor"] == 2
+    assert profile["floor_basis"] == "parallel"
+
+
