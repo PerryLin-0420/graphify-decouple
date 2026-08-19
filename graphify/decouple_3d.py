@@ -247,6 +247,10 @@ def _page(scene_json: str, title: str, stats: str, has_proposed: bool) -> str:
   .muted {{ color: #666; font-size: 11px; }}
   #notes {{ padding: 12px 14px; font-size: 11px; color: #777; line-height: 1.55; border-top: 1px solid #2a2a4e; margin-top: auto; }}
   #hint {{ position: absolute; left: 12px; bottom: 10px; font-size: 11px; color: #556; }}
+  #gap-row {{ flex-direction: column; align-items: stretch; gap: 4px; cursor: default; padding-top: 10px; padding-bottom: 10px; }}
+  #gap-row:hover {{ background: none; }}
+  #gap-row .gap-label {{ display: flex; justify-content: space-between; }}
+  #gap-slider {{ width: 100%; accent-color: #7dd3fc; }}
   #tip {{ position: absolute; padding: 4px 8px; background: #000c; border: 1px solid #3a3a5e; border-radius: 4px; font-size: 12px; pointer-events: none; display: none; }}
 </style>
 </head>
@@ -254,6 +258,10 @@ def _page(scene_json: str, title: str, stats: str, has_proposed: bool) -> str:
 <div id="view"><div id="tip"></div><div id="hint">drag to rotate &middot; wheel to zoom &middot; shift+drag to pan &middot; click a region to highlight its connections</div></div>
 <div id="sidebar">
   {decouple_toggle_html}
+  <div class="row" id="gap-row">
+    <div class="gap-label"><span>Region spacing</span><span class="muted" id="gap-value">100</span></div>
+    <input type="range" id="gap-slider" min="60" max="500" value="100" step="10">
+  </div>
   <h3>Floors</h3>
   <div id="floor-list"></div>
   <h3>Links</h3>
@@ -283,12 +291,125 @@ view.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, 1, 1, 200000);
 
+// ---- disc packing, ported from decouple.py's _pack_discs/_ring_positions
+// (see those docstrings for the algorithms) — lets the "region spacing"
+// slider below actually RE-PACK the layout at a new gap, rather than just
+// rescaling the server-baked one. Only the (x, y) PACKING is reproduced
+// here, not member scatter or the "after" satellite layout: every member
+// point and every proposed-group region keeps its ORIGINAL offset from
+// its own parent disc's center (captured once, below, from the positions
+// the server already baked in) and is translated by however far that
+// parent moved — cheaper than re-deriving the scatter hash or the
+// satellite-angle math in JS, and gives the identical visual result since
+// neither offset depends on gap.
+function packDiscsJS(sizes, gap) {{
+  const placed = [];
+  const out = new Map();
+  const ordered = sizes.slice().sort((a, b) => b.radius - a.radius || (a.id < b.id ? -1 : 1));
+  ordered.forEach(({{ id, radius }}) => {{
+    if (placed.length === 0) {{
+      out.set(id, {{ x: 0, y: 0 }});
+      placed.push({{ x: 0, y: 0, r: radius }});
+      return;
+    }}
+    const step = Math.max(radius * 0.35, 25.0);
+    let theta = 0.0;
+    while (true) {{
+      const rad = step * theta / (2 * Math.PI);
+      const x = rad * Math.cos(theta), y = rad * Math.sin(theta);
+      let clear = true;
+      for (const pl of placed) {{
+        if (Math.hypot(x - pl.x, y - pl.y) < radius + pl.r + gap) {{ clear = false; break; }}
+      }}
+      if (clear) {{
+        out.set(id, {{ x, y }});
+        placed.push({{ x, y, r: radius }});
+        break;
+      }}
+      theta += 0.35;
+    }}
+  }});
+  return out;
+}}
+function ringPositionsJS(sizes, innerExtent, gap) {{
+  const out = new Map();
+  if (!sizes.length) return out;
+  const ordered = sizes.slice().sort((a, b) => b.radius - a.radius || (a.id < b.id ? -1 : 1));
+  const widest = Math.max(...ordered.map(s => s.radius));
+  const circumference = ordered.reduce((sum, o) => sum + 2 * o.radius + gap, 0);
+  const radius = Math.max(innerExtent + gap + widest, circumference / (2 * Math.PI));
+  let angle = 0.0;
+  ordered.forEach(({{ id, radius: r }}) => {{
+    const span = 1.15 * (2 * r + gap) / radius;
+    angle += span / 2;
+    out.set(id, {{ x: radius * Math.cos(angle), y: radius * Math.sin(angle) }});
+    angle += span / 2;
+  }});
+  return out;
+}}
+const regionById = new Map(SCENE.regions.map(r => [r.id, r]));
+const beforeRegions = SCENE.regions.filter(r => r.state !== 'after');
+const afterRegions = SCENE.regions.filter(r => r.state === 'after');
+const connectedSizes = beforeRegions.filter(r => !r.isolated).map(r => ({{ id: r.id, radius: r.r }}));
+const isolatedSizes = beforeRegions.filter(r => r.isolated).map(r => ({{ id: r.id, radius: r.r }}));
+// A proposed group's fixed offset from the ORIGINAL class disc it would
+// replace — captured from the server-baked positions before any repack,
+// since neither depends on gap (see the satellite layout in
+// _proposed_group_regions).
+const afterOffsets = new Map();
+afterRegions.forEach(r => {{
+  const parent = regionById.get(r.replaces);
+  if (parent) afterOffsets.set(r.id, {{ dx: r.x - parent.x, dy: r.y - parent.y }});
+}});
+function computeRegionPositions(gap) {{
+  const innerPos = packDiscsJS(connectedSizes, gap);
+  let innerExtent = 0;
+  innerPos.forEach((pos, id) => {{
+    innerExtent = Math.max(innerExtent, Math.hypot(pos.x, pos.y) + regionById.get(id).r);
+  }});
+  const outerPos = ringPositionsJS(isolatedSizes, innerExtent, gap);
+  const pos = new Map();
+  innerPos.forEach((p, id) => pos.set(id, p));
+  outerPos.forEach((p, id) => pos.set(id, p));
+  afterRegions.forEach(r => {{
+    const parent = pos.get(r.replaces);
+    const off = afterOffsets.get(r.id);
+    if (parent && off) pos.set(r.id, {{ x: parent.x + off.dx, y: parent.y + off.dy }});
+  }});
+  return pos;
+}}
+// Every region's CURRENT center. Starts EXACTLY at the server-baked
+// positions — matching the 2D view pixel for pixel — and only diverges
+// once the user actually moves the slider below; `repackAt` is what does
+// that, mutating this Map in place so every mesh/link redraw has one
+// source of truth to read from.
+const regionPos = new Map(SCENE.regions.map(r => [r.id, {{ x: r.x, y: r.y }}]));
+function repackAt(gap) {{
+  regionPos.clear();
+  computeRegionPositions(gap).forEach((pos, id) => regionPos.set(id, pos));
+}}
+
+// The MAXIMUM gap the slider allows, packed once (without touching
+// regionPos) purely to size the floor grids generously enough that
+// widening the gap later never runs the layout off the edge of the
+// visible grid.
+const MAX_GAP = 500;
+const DEFAULT_GAP = 100;
+let extentAtMaxGap = 1000;
+computeRegionPositions(MAX_GAP).forEach((pos, id) => {{
+  extentAtMaxGap = Math.max(extentAtMaxGap, Math.hypot(pos.x, pos.y) + regionById.get(id).r);
+}});
+
 // The floor planes reuse the 2D view's (x, y) packing, whose extent scales
 // with corpus size — so the gap BETWEEN floors has to scale with it too. A
 // fixed spacing looks correct on a small graph and collapses into a nearly
 // flat stack on a large one (measured: a 69-region corpus spreads to
 // ~4900 units wide, against which a fixed 900-unit gap reads as no
-// separation at all).
+// separation at all). FLOOR_SPACING (Z) is fixed at the page's baked
+// starting gap and does not change when the region-spacing slider below
+// moves — the slider widens/narrows the (x, y) packing only ("寬度"/
+// width, as asked for); re-deriving vertical floor separation from every
+// gap change would conflate two different knobs.
 let extent = 1000;
 SCENE.regions.forEach(r => {{
   extent = Math.max(extent, Math.abs(r.x) + r.r, Math.abs(r.y) + r.r);
@@ -322,9 +443,13 @@ function addToFloor(f, obj) {{
 }}
 
 // Floor planes: a faint grid per occupied floor, so the stack reads as
-// discrete layers even where a floor holds only one region.
+// discrete layers even where a floor holds only one region. Sized off
+// `extentAtMaxGap`, not the page's starting `extent` — the region-spacing
+// slider below can widen the (x, y) packing well past the starting
+// layout, and the grid has to already be big enough to still look like a
+// floor under it rather than running out at the edges.
 SCENE.floors.forEach(f => {{
-  const grid = new THREE.GridHelper(extent * 2.2, 16, 0x3a3a5e, 0x24243c);
+  const grid = new THREE.GridHelper(extentAtMaxGap * 2.2, 16, 0x3a3a5e, 0x24243c);
   grid.rotation.x = Math.PI / 2;          // GridHelper is XZ by default; we work in XY
   grid.position.z = floorZ(f);
   grid.material.opacity = 0.28;
@@ -335,7 +460,7 @@ SCENE.floors.forEach(f => {{
 // it — a reddish, sparser grid so it reads as "not a real measured floor"
 // rather than blending into the numbered stack.
 if (SCENE.regions.some(r => r.floor === null)) {{
-  const grid = new THREE.GridHelper(extent * 2.2, 8, 0x5e3a3a, 0x241c24);
+  const grid = new THREE.GridHelper(extentAtMaxGap * 2.2, 8, 0x5e3a3a, 0x241c24);
   grid.rotation.x = Math.PI / 2;
   grid.position.z = UNKNOWN_Z;
   grid.material.opacity = 0.22;
@@ -348,16 +473,26 @@ if (SCENE.regions.some(r => r.floor === null)) {{
 // RECOMMENDED split's proposed group, from _proposed_group_regions) — every
 // mesh belonging to a region carries `regionId` so applyVisibility can gate
 // on before/after state, not just on which floor checkboxes are on.
+//
+// Positions come from `regionPos` (currently == the server-baked r.x/r.y),
+// not `r.x`/`r.y` directly, and every disc/ring/points object plus each
+// member's own offset from its region's center is stashed in the maps
+// below — `repositionScene` (see the region-spacing slider) is what reads
+// them back to move everything when the packing gap changes.
+const discById = new Map(), ringById = new Map(), pointsById = new Map();
+const memberOffsets = new Map();
 SCENE.regions.forEach(r => {{
+  const pos = regionPos.get(r.id);
   const color = new THREE.Color(r.color);
   const isProposed = r.state === 'after';
   const disc = new THREE.Mesh(
     new THREE.CircleGeometry(r.r, 48),
     new THREE.MeshBasicMaterial({{ color, transparent: true, opacity: isProposed ? 0.28 : 0.20, side: THREE.DoubleSide }})
   );
-  disc.position.set(r.x, r.y, floorZ(r.floor));
+  disc.position.set(pos.x, pos.y, floorZ(r.floor));
   disc.userData = {{ label: r.label, kind: 'region', spans: r.spans, floor: r.floor, n: r.member_count, regionId: r.id, isolated: r.isolated }};
   addToFloor(r.floor, disc);
+  discById.set(r.id, disc);
 
   // A dashed ring for a proposed group — same "not real yet" signal the 2D
   // view's diamond ring uses — vs. a solid ring for an existing class/module.
@@ -381,6 +516,7 @@ SCENE.regions.forEach(r => {{
   ring.position.copy(disc.position);
   ring.userData = {{ regionId: r.id }};
   addToFloor(r.floor, ring);
+  ringById.set(r.id, ring);
 
   // Members as points inside the disc, at the EXACT (x, y) the 2D view
   // placed them at (see build_floor_scene) — not a separately recomputed
@@ -391,12 +527,18 @@ SCENE.regions.forEach(r => {{
   // cross-floor signal this view exists to show.
   if (r.members && r.members.length) {{
     const positions = [];
-    r.members.forEach(m => {{ positions.push(m.x, m.y, floorZ(m.floor)); }});
+    const offsets = [];
+    r.members.forEach(m => {{
+      positions.push(m.x, m.y, floorZ(m.floor));
+      offsets.push({{ dx: m.x - pos.x, dy: m.y - pos.y }});
+    }});
+    memberOffsets.set(r.id, offsets);
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
     const pts = new THREE.Points(geo, new THREE.PointsMaterial({{ color, size: 14, transparent: true, opacity: 0.95 }}));
     pts.userData = {{ regionId: r.id }};
     addToFloor(r.floor, pts);
+    pointsById.set(r.id, pts);
   }}
 }});
 
@@ -409,13 +551,13 @@ SCENE.regions.forEach(r => {{
 // edge either) — clicking a region does not hide anything, it HIGHLIGHTS
 // that region's own links and dims the rest (see updateLinkEmphasis),
 // mirroring vis-network's own node-selection emphasis in the 2D view.
-const regionById = new Map(SCENE.regions.map(r => [r.id, r]));
 const allLinkLines = [];
 function addLinkSet(linkList, linkState) {{
   linkList.forEach(l => {{
-    const a = regionById.get(l.source), b = regionById.get(l.target);
-    if (!a || !b) return;
-    const crosses = a.floor !== b.floor;
+    const a = regionPos.get(l.source), b = regionById.get(l.target) && regionPos.get(l.target);
+    const af = regionById.get(l.source), bf = regionById.get(l.target);
+    if (!a || !b || !af || !bf) return;
+    const crosses = af.floor !== bf.floor;
     // A same-floor link runs between two discs at the SAME Z, so drawn at
     // floorZ exactly it is coplanar with both discs and the floor grid —
     // buried inside the semi-transparent disc surface and invisible, which
@@ -426,8 +568,8 @@ function addLinkSet(linkList, linkState) {{
     // they need no lift.
     const lift = crosses ? 0 : FLOOR_SPACING * 0.04;
     const geo = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(a.x, a.y, floorZ(a.floor) + lift),
-      new THREE.Vector3(b.x, b.y, floorZ(b.floor) + lift),
+      new THREE.Vector3(a.x, a.y, floorZ(af.floor) + lift),
+      new THREE.Vector3(b.x, b.y, floorZ(bf.floor) + lift),
     ]);
     const baseOpacity = crosses ? 0.7 : 0.6;
     const line = new THREE.Line(geo, new THREE.LineBasicMaterial({{
@@ -443,8 +585,8 @@ function addLinkSet(linkList, linkState) {{
     // Math.min would silently coerce a `null` (unknown) end to 0 and file
     // the link under floor 0 — if EITHER end is unknown, the link belongs
     // in the unknown band instead, same as an unknown region's own disc.
-    line.userData = {{ crosses, pairFloors: [a.floor, b.floor], linkState, source: l.source, target: l.target, baseOpacity }};
-    const bucketFloor = (a.floor === null || b.floor === null) ? null : Math.min(a.floor, b.floor);
+    line.userData = {{ crosses, pairFloors: [af.floor, bf.floor], linkState, source: l.source, target: l.target, baseOpacity }};
+    const bucketFloor = (af.floor === null || bf.floor === null) ? null : Math.min(af.floor, bf.floor);
     addToFloor(bucketFloor, line);
     allLinkLines.push(line);
   }});
@@ -452,6 +594,67 @@ function addLinkSet(linkList, linkState) {{
 addLinkSet(SCENE.links, 'before');
 addLinkSet(SCENE.links_after, 'after');
 let selectedRegionId = null;
+
+// ---- region-spacing slider -------------------------------------------------
+// Re-runs the SAME packing at a new gap (see packDiscsJS/ringPositionsJS
+// above) and moves every disc/ring/member-point/link to match, without
+// rebuilding any geometry (mutating position attributes in place is far
+// cheaper than disposing and recreating meshes on every slider tick).
+function repositionScene(gap) {{
+  repackAt(gap);
+  SCENE.regions.forEach(r => {{
+    const pos = regionPos.get(r.id);
+    if (!pos) return;
+    const disc = discById.get(r.id);
+    if (disc) {{ disc.position.x = pos.x; disc.position.y = pos.y; }}
+    const ring = ringById.get(r.id);
+    if (ring) {{ ring.position.x = pos.x; ring.position.y = pos.y; }}
+    const pts = pointsById.get(r.id);
+    const offs = memberOffsets.get(r.id);
+    if (pts && offs) {{
+      const arr = pts.geometry.attributes.position.array;
+      offs.forEach((o, i) => {{
+        arr[i * 3] = pos.x + o.dx;
+        arr[i * 3 + 1] = pos.y + o.dy;
+      }});
+      pts.geometry.attributes.position.needsUpdate = true;
+    }}
+  }});
+  allLinkLines.forEach(line => {{
+    const a = regionPos.get(line.userData.source), b = regionPos.get(line.userData.target);
+    if (!a || !b) return;
+    const lift = line.userData.crosses ? 0 : FLOOR_SPACING * 0.04;
+    const [fa, fb] = line.userData.pairFloors;
+    const arr = line.geometry.attributes.position.array;
+    arr[0] = a.x; arr[1] = a.y; arr[2] = floorZ(fa) + lift;
+    arr[3] = b.x; arr[4] = b.y; arr[5] = floorZ(fb) + lift;
+    line.geometry.attributes.position.needsUpdate = true;
+  }});
+  // Widens the wheel-zoom clamp (below) to match — otherwise a large gap
+  // can spread the layout well past what the zoomed-in default distance
+  // was ever meant to frame, with no way to scroll out far enough to see it.
+  let newExtent = 1000;
+  regionPos.forEach((pos, id) => {{
+    newExtent = Math.max(newExtent, Math.hypot(pos.x, pos.y) + regionById.get(id).r);
+  }});
+  extent = newExtent;
+}}
+const gapSlider = document.getElementById('gap-slider');
+const gapValue = document.getElementById('gap-value');
+if (gapSlider) {{
+  gapSlider.value = DEFAULT_GAP;
+  gapValue.textContent = DEFAULT_GAP;
+  // The live number updates on every tick (cheap); the actual re-pack is
+  // debounced so a fast drag across 60-500 doesn't queue up dozens of
+  // full O(n^2) packing passes — only the value the user settles on runs.
+  let gapTimer = null;
+  gapSlider.addEventListener('input', e => {{
+    const gap = Number(e.target.value);
+    gapValue.textContent = gap;
+    if (gapTimer) clearTimeout(gapTimer);
+    gapTimer = setTimeout(() => repositionScene(gap), 80);
+  }});
+}}
 
 // Selecting a region HIGHLIGHTS its own links (full base opacity) and DIMS
 // every other link (a faint 0.04) rather than hiding anything — same
