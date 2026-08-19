@@ -209,6 +209,24 @@ _BOUNDARY_NAME_TOKENS = frozenset({
 # chain.
 _HOP_COST: dict[str, int] = {"calls": 1, "indirect_call": 1, "method": 0}
 
+# Kinds of node the parallel pass (`_parallel_floors`) refuses to place,
+# even when wired to a measured unit — the same "prose is not doing
+# parser-stage work" exclusion `boundary_reason` applies, generalized to
+# every non-code kind graphify's graph carries (see
+# `graphify.validate.VALID_FILE_TYPES`). Deliberately a DENY list, not
+# `== "code"`: an edge's TARGET is frequently a node the extractor never
+# explicitly created — an external package name (`imports_from` naming
+# `react`, a Rust crate, an Android API class) round-trips through
+# networkx's node_link_graph as a bare id with NO attributes at all,
+# `file_type` included. Measured on a real multi-language corpus
+# (Bynalix-main: TS/TSX + Rust + Kotlin): 47 such attribute-less nodes,
+# every one a genuine external dependency wired by a real `imports_from`
+# edge from a floor-2 file — an `== "code"` check excluded every one of
+# them from ever receiving a floor, the identical "wired but reported
+# unknown" contradiction the parallel pass exists to remove, just via a
+# different root cause (a missing attribute instead of a missing region).
+_NON_CODE_FILE_TYPES = frozenset({"document", "paper", "image", "rationale", "concept"})
+
 
 # Where a node's floor came from. Recorded per node because the three
 # passes below are three different STRENGTHS of evidence, and a report that
@@ -265,13 +283,21 @@ def _parallel_floors(
     — but a known-floor unit is a SOURCE, never a relay, so evidence cannot
     tunnel through an already-measured unit to a shallower floor behind it.
 
-    Restricted to `file_type == "code"` nodes, the same restriction
-    `boundary_reason` applies and for the same reason: a docstring or
-    concept node has no position in a data flow to report. It can still be
-    adjacent to one, but "this prose documents a parser" is not the prose
-    doing parser-stage work. Excluding them also keeps this pass from
-    relaying a floor between two unrelated code units through the docstring
-    that happens to mention both.
+Excludes known non-code kinds (`_NON_CODE_FILE_TYPES`: document, paper,
+    image, rationale, concept) — the same restriction `boundary_reason`
+    applies and for the same reason: a docstring or concept node has no
+    position in a data flow to report. It can still be adjacent to one, but
+    "this prose documents a parser" is not the prose doing parser-stage
+    work. Excluding them also keeps this pass from relaying a floor between
+    two unrelated code units through the docstring that happens to mention
+    both. A DENY list, not an `== "code"` allow list: an edge's target is
+    often a node the extractor never explicitly created (an external
+    package name — `react`, a Rust crate, an Android API class — that only
+    ever appears as an `imports_from` target) and round-trips through
+    networkx with NO attributes at all, `file_type` included. Requiring
+    `== "code"` excluded every one of those — a genuine external dependency
+    with a real wired edge from a measured file — from ever getting a
+    floor; measured on a real multi-language corpus, 47 such nodes.
 
     `region_of`, when given, runs this pass at REGION granularity instead
     of per-node: every member of a region is placed together (a region
@@ -303,7 +329,7 @@ def _parallel_floors(
     for n in G.nodes:
         u = unit_of(n)
         members_of.setdefault(u, []).append(n)
-        if G.nodes[n].get("file_type") == "code":
+        if G.nodes[n].get("file_type") not in _NON_CODE_FILE_TYPES:
             has_code[u] = True
     assigned: dict[str, int] = {}
     placed = set(unit_floor)

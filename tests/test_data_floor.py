@@ -336,6 +336,27 @@ def test_a_non_code_node_is_never_given_a_parallel_floor():
     assert floors == {"parser": 0}
 
 
+def test_an_attribute_less_edge_endpoint_is_still_eligible_for_a_parallel_floor():
+    """`networkx.node_link_graph` auto-creates a bare, ZERO-attribute node
+    for any edge endpoint the JSON never explicitly declared — this is
+    exactly what an external package reference looks like in a real
+    multi-language corpus (`imports_from` naming `react`, a Rust crate, an
+    Android API class round-trips with NO `file_type` at all). The old
+    `== "code"` eligibility check excluded these from ever getting a
+    floor, contradicting a real, drawn `imports_from` edge from a measured
+    file — measured on a real corpus (TS/TSX + Rust + Kotlin): 47 such
+    nodes, 116 links reporting "unknown" while visibly wired to a known
+    floor. `file_type` unset must be treated as "not verified non-code",
+    not lumped in with rationale/concept/document."""
+    g = nx.DiGraph()
+    _code(g, "parser", "parse_file()", source_file="app/parser/p.py")
+    g.add_node("ref_react")  # no attributes at all, same as node_link_graph produces
+    g.add_edge("parser", "ref_react", relation="imports_from")
+    floors, _ = compute_floors(g)
+    assert floors["parser"] == 0
+    assert floors["ref_react"] == 0  # placed alongside it, not left unknown
+
+
 def test_a_unit_with_no_edge_to_any_known_floor_is_the_only_real_unknown():
     """What "unknown" means after this pass: not "no call path", but "no
     path of ANY edge kind". `island` is wired to another unplaced unit and
