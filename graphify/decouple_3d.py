@@ -28,13 +28,19 @@ one pinned script is one less supply-chain surface.
 Honest limits, surfaced in the page itself:
   - Floors come from `data_floor`, a NAME heuristic for the I/O boundary,
     not I/O analysis. A wrong floor 0 shifts everything above it.
-  - A region with no known floor (no boundary reachable from any of its
-    members) is never defaulted to floor 0 — it is rendered on its own
-    dedicated "unknown" band below the numbered stack instead of being
-    dropped outright. Dropping it silently erased every real link to or
-    from it too: a well-connected unit whose only calls happen to land on
-    other floor-unknown units looked completely disconnected for a reason
-    that had nothing to do with its actual connectivity.
+  - A region with no known floor is never defaulted to floor 0 — it is
+    rendered on its own dedicated "unknown" band below the numbered stack
+    instead of being dropped outright. Dropping it silently erased every
+    real link to or from it too: a well-connected unit whose only calls
+    happen to land on other floor-unknown units looked completely
+    disconnected for a reason that had nothing to do with its actual
+    connectivity.
+  - That band used to hold units this view was itself drawing links from,
+    which said two contradictory things at once. `data_floor`'s parallel
+    pass now places any unit wired to a placed one (by any edge kind) on
+    that unit's floor, so what remains on the band is only what genuinely
+    connects to nothing measured — the links you can see are the reason it
+    is no longer there.
 """
 from __future__ import annotations
 
@@ -602,7 +608,7 @@ renderer.domElement.addEventListener('mousemove', e => {{
     tip.style.display = 'block';
     tip.style.left = (e.clientX - rect.left + 12) + 'px';
     tip.style.top = (e.clientY - rect.top + 10) + 'px';
-    const floorText = d.floor === null ? 'unknown (no boundary reachable)' : d.floor;
+    const floorText = d.floor === null ? 'unknown (not linked to any measured unit)' : d.floor;
     tip.textContent = d.label + ' — floor ' + floorText + ', ' + d.n + ' members'
       + (d.spans ? ' (spans ' + (d.spans + 1) + ' floors)' : '');
   }} else {{
@@ -762,11 +768,21 @@ def write_decouple_3d_html(
     rather than an empty stack that would imply the analysis ran and found
     a flat system.
     """
-    from graphify.data_floor import compute_floors
     from graphify.decouple import _class_cluster_layout
     from graphify.exporters.base import COMMUNITY_COLORS
 
-    floors, _reasons = compute_floors(G)
+    # Taken from the plan, which computed the whole layering once (see
+    # decouple_plan) — this view must not disagree with the report it
+    # illustrates about which floor anything is on, or about which units
+    # have no floor at all. Recomputed only for a caller holding a plan
+    # built before `data_floors` existed.
+    floor_data = plan.get("data_floors")
+    if floor_data is not None:
+        floors = floor_data["floors"]
+    else:
+        from graphify.data_floor import compute_floors
+
+        floors, _reasons = compute_floors(G)
     if not floors:
         return None
 

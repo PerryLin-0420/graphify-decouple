@@ -13,6 +13,7 @@ from graphify.data_floor import (
     boundary_reason,
     class_floor_profile,
     compute_floors,
+    compute_floors_with_provenance,
     cross_floor_risk,
 )
 
@@ -223,6 +224,152 @@ def test_unreachable_component_has_no_floor_rather_than_zero():
     floors, _ = compute_floors(g)
     assert floors == {"parser": 0}
     assert "island" not in floors  # absent, NOT floor 0
+
+
+# ── parallel pass: a non-call edge to a known floor is not "unknown" ───
+
+def test_a_unit_wired_to_floor_zero_by_a_non_call_edge_is_placed_on_floor_zero():
+    """The contradiction this pass removes: `helper` has a real, visible
+    edge to a floor-0 parser — just not a call-shaped one, so no distance
+    to it can be MEASURED. Reporting it as unknown while the 3D view drew
+    that very link said two different things about the same node. It sits
+    ALONGSIDE the boundary, so it is placed on floor 0 — parallel, at zero
+    cost, never one floor below."""
+    g = nx.DiGraph()
+    _code(g, "parser", "parse_file()", source_file="app/parser/p.py")
+    _code(g, "helper", "Helper", source_file="app/core/helper.py")
+    g.add_edge("helper", "parser", relation="imports")
+    floors, _ = compute_floors(g)
+    assert floors["helper"] == 0
+
+
+def test_parallel_placement_never_deepens_the_stack():
+    """Zero cost is the whole reason these edge kinds can be used here at
+    all: charging them a floor is the documented failure (`rationale_for`
+    nodes inheriting their subject's floor + 1 pushed the tallest floor
+    past 20 out of documentation alone). The tallest floor must be the same
+    with and without the parallel edge."""
+    g = nx.DiGraph()
+    _code(g, "boundary", "load_config()", source_file="app/io/thing.py")
+    _code(g, "a", "a()", source_file="app/one.py")
+    _code(g, "b", "b()", source_file="app/two.py")
+    g.add_edge("a", "b", relation="calls")
+    g.add_edge("b", "boundary", relation="calls")
+    tallest_before = max(compute_floors(g)[0].values())
+    _code(g, "doc_ish", "Notes", source_file="app/core/notes.py")
+    g.add_edge("doc_ish", "a", relation="references")  # a sits at floor 2
+    floors, _ = compute_floors(g)
+    assert floors["doc_ish"] == 2  # same floor as `a`, not 3
+    assert max(floors.values()) == tallest_before
+
+
+def test_parallel_pass_never_overwrites_a_call_measured_floor():
+    """A measured distance always wins over adjacency. `b` is two hops from
+    the boundary by call structure AND directly adjacent to it by an
+    `imports` edge — it stays on floor 2."""
+    g = nx.DiGraph()
+    _code(g, "boundary", "load_config()", source_file="app/io/thing.py")
+    _code(g, "a", "a()", source_file="app/one.py")
+    _code(g, "b", "b()", source_file="app/two.py")
+    g.add_edge("a", "boundary", relation="calls")
+    g.add_edge("b", "a", relation="calls")
+    g.add_edge("b", "boundary", relation="imports")  # adjacency to floor 0
+    floors, _ = compute_floors(g)
+    assert floors["b"] == 2
+
+
+def test_parallel_takes_the_shallowest_reachable_known_floor():
+    """Adjacent to both a floor-0 unit and a floor-2 one, the shallow
+    evidence wins — the rescue pass's question ("is there close evidence"),
+    not the main pass's ("what is the worst dependency")."""
+    g = nx.DiGraph()
+    _code(g, "boundary", "load_config()", source_file="app/io/thing.py")
+    _code(g, "mid", "mid()", source_file="app/one.py")
+    _code(g, "deep", "deep()", source_file="app/two.py")
+    g.add_edge("mid", "boundary", relation="calls")
+    g.add_edge("deep", "mid", relation="calls")  # deep sits at floor 2
+    _code(g, "shared", "Shared", source_file="app/util/shared.py")
+    g.add_edge("shared", "boundary", relation="uses")
+    g.add_edge("shared", "deep", relation="uses")
+    floors, _ = compute_floors(g)
+    assert floors["deep"] == 2
+    assert floors["shared"] == 0
+
+
+def test_parallel_relays_through_unplaced_units_but_not_through_placed_ones():
+    """A chain of unplaced units hanging off a known floor all lands on it
+    (`far` is connected to the system, just further along the same chain of
+    non-call edges). But an already-measured unit is a SOURCE, never a
+    relay: `behind` reaches floor 0 only THROUGH the floor-2 `deep`, so it
+    is placed at 2, not tunneled to 0 past it."""
+    g = nx.DiGraph()
+    _code(g, "boundary", "load_config()", source_file="app/io/thing.py")
+    _code(g, "mid", "mid()", source_file="app/one.py")
+    _code(g, "deep", "deep()", source_file="app/two.py")
+    g.add_edge("mid", "boundary", relation="calls")
+    g.add_edge("deep", "mid", relation="calls")  # floor 2
+
+    _code(g, "near", "Near", source_file="app/util/near.py")
+    _code(g, "far", "Far", source_file="app/util/far.py")
+    g.add_edge("near", "boundary", relation="uses")
+    g.add_edge("far", "near", relation="uses")  # relayed via an unplaced unit
+    _code(g, "behind", "Behind", source_file="app/util/behind.py")
+    g.add_edge("behind", "deep", relation="uses")  # only route out is via floor 2
+    floors, _ = compute_floors(g)
+    assert floors["near"] == 0
+    assert floors["far"] == 0
+    assert floors["behind"] == 2
+
+
+def test_a_non_code_node_is_never_given_a_parallel_floor():
+    """Same restriction `boundary_reason` applies, for the same reason: a
+    docstring node has no position in a data flow to report. It can be
+    adjacent to one — that is what `rationale_for` MEANS — but documenting
+    a parser is not doing parser-stage work, and letting prose nodes carry
+    floors would also let them relay one between two unrelated units."""
+    g = nx.DiGraph()
+    _code(g, "parser", "parse_file()", source_file="app/parser/p.py")
+    g.add_node("_rationale_1", label="Parses the touchstone file into records.",
+               file_type="rationale", source_file="app/parser/p.py")
+    g.add_edge("_rationale_1", "parser", relation="rationale_for")
+    floors, _ = compute_floors(g)
+    assert floors == {"parser": 0}
+
+
+def test_a_unit_with_no_edge_to_any_known_floor_is_the_only_real_unknown():
+    """What "unknown" means after this pass: not "no call path", but "no
+    path of ANY edge kind". `island` is wired to another unplaced unit and
+    to nothing else — the whole component is unmeasured, so both stay
+    absent rather than being defaulted to floor 0."""
+    g = nx.DiGraph()
+    _code(g, "parser", "parse_file()", source_file="app/parser/p.py")
+    _code(g, "island", "compute()", source_file="app/core/a.py")
+    _code(g, "island2", "adjust()", source_file="app/core/b.py")
+    g.add_edge("island", "island2", relation="uses")
+    floors, _ = compute_floors(g)
+    assert floors == {"parser": 0}
+
+
+def test_provenance_records_which_pass_placed_each_unit():
+    """The three passes are three strengths of evidence, and a report that
+    shows them as one number cannot be audited: a floor 0 measured by a
+    call chain into a parser and a floor 0 inherited from sitting next to
+    one are not the same claim."""
+    g = nx.DiGraph()
+    _code(g, "parser", "parse_file()", source_file="app/parser/p.py")
+    _code(g, "caller", "orchestrate()", source_file="app/core/run.py")
+    g.add_edge("caller", "parser", relation="calls")
+    _code(g, "built", "Record", source_file="app/model/record.py")
+    g.add_edge("parser", "built", relation="calls")  # constructed BY the boundary
+    _code(g, "neighbor", "Neighbor", source_file="app/util/n.py")
+    g.add_edge("neighbor", "parser", relation="imports")
+    floors, reasons, provenance = compute_floors_with_provenance(g)
+    assert provenance["parser"] == "boundary"
+    assert provenance["caller"] == "call"
+    assert provenance["built"] == "rescue"
+    assert provenance["neighbor"] == "parallel"
+    assert set(provenance) == set(floors)
+    assert set(reasons) == {"parser"}
 
 
 # ── rescue pass: floor via a known-floor CALLER, not just own calls ─────────

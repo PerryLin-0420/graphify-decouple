@@ -57,8 +57,23 @@ turn. Measured on a real corpus: 41% of callable code had a floor from the
 main pass alone; the rescue pass raised that to 71% without deepening the
 tallest floor at all.
 
-Only edges that represent actual runtime structure count, and they are
-WEIGHTED — see `_HOP_COST`. graphify's graph also carries edges like
+A unit neither pass can place is not necessarily unmeasurable — it may
+simply be wired to the rest of the system by an edge that carries no
+DISTANCE. Measured on a real corpus: of 1272 units with no floor after
+both call passes, exactly zero had a `calls`/`method` edge to a unit that
+had one, while 571 of them had a `contains`, `rationale_for`, `imports`,
+`uses` or `inherits` edge to one — 299 straight to a floor-0 unit. Those
+were reported as "unknown" while the 3D view happily drew their links,
+which is two different claims about the same node. A third PARALLEL pass
+(`_parallel_floors`) closes that: a unit the call passes could not place,
+but which is wired to one they did, is placed ON that unit's floor at ZERO
+cost — alongside it, never one floor below. Zero is what makes those edge
+kinds usable here at all; charging them a floor is the documented failure
+below. After it, "unknown floor" means what it says: no path of ANY edge
+kind to a measured unit.
+
+Only edges that represent actual runtime structure carry DISTANCE, and
+they are WEIGHTED — see `_HOP_COST`. graphify's graph also carries edges like
 `rationale_for` (a docstring node documenting a symbol), `contains` (file
 lists symbol), `imports`, `references`, `inherits`,
 `conceptually_related_to`: none of these is a runtime relationship, and
@@ -100,11 +115,16 @@ Honest limits:
   - A graph with no detectable boundary yields NO floors at all (an empty
     dict), not a fabricated layering rooted at an arbitrary node.
   - A unit reachable from NEITHER a boundary via its own calls NOR a
-    known-floor caller (via the rescue pass) is absent from the result —
-    unreachable, not floor 0. This includes a unit whose ONLY edges are
-    non-call ones (a rationale node with nothing but a `rationale_for`
-    edge, a file-level `contains` leaf) — it is not "at the boundary" just
-    because it has no distance to measure.
+    known-floor caller NOR any non-runtime edge to a placed unit (the
+    parallel pass) is absent from the result — unmeasured, not floor 0.
+    That is now a genuinely isolated unit: connected to nothing whose
+    floor is known, by any kind of edge.
+  - A floor from the parallel pass is WEAKER evidence than a measured one:
+    it says "this sits alongside something at floor N", not "this is N
+    hops from the boundary". `compute_floors_with_provenance` reports
+    which pass placed each unit so the two are never confused; a
+    non-`code` node (a docstring, a concept) is never placed by it at all,
+    the same restriction `boundary_reason` applies.
   - A boundary node's own floor is fixed at 0 even if some OTHER, longer
     chain also happens to reach it — being an I/O boundary is what floor 0
     MEANS, not a distance to be second-guessed by a path through something
@@ -190,6 +210,88 @@ _BOUNDARY_NAME_TOKENS = frozenset({
 _HOP_COST: dict[str, int] = {"calls": 1, "indirect_call": 1, "method": 0}
 
 
+# Where a node's floor came from. Recorded per node because the three
+# passes below are three different STRENGTHS of evidence, and a report that
+# shows them all as one number cannot be audited: a floor 0 measured by a
+# call chain to a parser and a floor 0 inherited from sitting next to one
+# are not the same claim.
+_PROV_BOUNDARY = "boundary"  # the node is itself an I/O boundary (floor 0)
+_PROV_CALL = "call"          # longest call path from a boundary (main pass)
+_PROV_RESCUE = "rescue"      # nearest known-floor CALLER (rescue pass)
+_PROV_PARALLEL = "parallel"  # non-runtime edge to a known floor (parallel pass)
+
+
+def _neighbors(G: nx.Graph, n: str) -> set:
+    """Every node adjacent to `n`, regardless of edge direction."""
+    if G.is_directed():
+        return set(G.predecessors(n)) | set(G.successors(n))
+    return set(G.neighbors(n))
+
+
+def _parallel_floors(G: nx.Graph, floors: dict[str, int]) -> dict[str, int]:
+    """Floors for units the CALL passes could not place, taken from a
+    non-runtime edge to a unit they could — the third and last pass of
+    `compute_floors_with_provenance`.
+
+    The two call passes are already closed over call structure: measured on
+    a real corpus, of 1272 units with no floor, exactly ZERO had a `calls`,
+    `indirect_call` or `method` edge to a unit that had one. Every remaining
+    "unknown" that was visibly wired to the rest of the system was wired by
+    a `contains`, `rationale_for`, `imports`, `uses` or `inherits` edge —
+    571 of them, 299 attached directly to a floor-0 unit. Those units were
+    reported as unknown while the 3D view drew their links (it aggregates
+    ALL edges), which is the contradiction this pass removes: a unit with a
+    real edge to floor 0 is not unmeasurable, it is ALONGSIDE floor 0.
+
+    So the floor is taken at ZERO cost — a parallel placement, not a hop:
+    the unit is put ON the floor of the nearest known unit, never one below
+    it. That is the whole reason these edge kinds can be used here at all
+    while `_HOP_COST` still excludes them. Charging them a floor was tried
+    and is exactly the failure documented in the module docstring (every
+    `_rationale_N` node inheriting its subject's floor + 1 pushed the
+    tallest floor past 20 out of documentation alone). At zero cost the
+    tallest floor cannot move: this pass only ever fills in floors that
+    already exist, and it NEVER overwrites one a call pass established.
+
+    Ties go to the SHALLOWEST reachable known floor (the BFS runs one
+    source level at a time, floor 0 first), for the rescue pass's reason:
+    this asks "is there close evidence", not "what is the worst
+    dependency". Propagation relays only through units this pass itself
+    placed, so a chain of unknowns hanging off floor 0 all lands on floor 0
+    — but a known-floor unit is a SOURCE, never a relay, so evidence cannot
+    tunnel through an already-measured unit to a shallower floor behind it.
+
+    Restricted to `file_type == "code"` nodes, the same restriction
+    `boundary_reason` applies and for the same reason: a docstring or
+    concept node has no position in a data flow to report. It can still be
+    adjacent to one, but "this prose documents a parser" is not the prose
+    doing parser-stage work. Excluding them also keeps this pass from
+    relaying a floor between two unrelated code units through the docstring
+    that happens to mention both.
+
+    What is left with no floor after this pass is the honest remainder: a
+    unit with no path of ANY edge kind to anything whose floor is known —
+    genuinely unmeasured, not merely unmeasured by call structure.
+    """
+    if not floors:
+        return {}
+    assigned: dict[str, int] = {}
+    placed = set(floors)
+    for level in sorted(set(floors.values())):
+        # Sorted at every step: the result must not depend on dict order.
+        queue = sorted(n for n in floors if floors[n] == level)
+        while queue:
+            cur = queue.pop(0)
+            for nb in sorted(_neighbors(G, cur)):
+                if nb in placed or nb in assigned:
+                    continue
+                if G.nodes[nb].get("file_type") != "code":
+                    continue
+                assigned[nb] = level
+                queue.append(nb)
+    return assigned
+
+
 def _same_module(G: nx.Graph, u: str, v: str) -> bool:
     """Whether two nodes are implemented in the same source file."""
     su = G.nodes[u].get("source_file")
@@ -271,7 +373,9 @@ def boundary_reason(G: nx.Graph, node_id: str) -> "str | None":
     return None
 
 
-def compute_floors(G: "nx.DiGraph") -> "tuple[dict[str, int], dict[str, str]]":
+def compute_floors_with_provenance(
+    G: "nx.DiGraph",
+) -> "tuple[dict[str, int], dict[str, str], dict[str, str]]":
     """Longest directed-path distance (hops) from the nearest I/O boundary
     node, computed on `G`'s strongly-connected-component condensation —
     see the module docstring for why longest (not shortest) and why the
@@ -285,14 +389,25 @@ def compute_floors(G: "nx.DiGraph") -> "tuple[dict[str, int], dict[str, str]]":
     one floor, a `method` containment edge costs zero (see the module
     docstring).
 
-    Returns `(floors, boundary_reasons)`. `floors` maps node id -> floor;
-    a unit reachable from NEITHER a boundary (via its own calls) NOR a
-    known-floor caller (via the rescue pass) is ABSENT (unknown floor),
-    never defaulted to 0 — this includes a unit whose only edges are
-    excluded ones (documentation, imports, file containment), which has no
-    more of a real position in the call structure than one with no edges
-    at all. `boundary_reasons` maps each floor-0 node to the
-    `boundary_reason` that put it there.
+    PLUS a third pass (`_parallel_floors`) for units neither call pass
+    could place but which are wired to one that was placed, by an edge
+    that carries no distance (`contains`, `imports`, `uses`, `inherits`).
+    Those are placed on that unit's floor at zero cost — alongside it.
+
+    All three run inside this one call. There is no later stage that
+    "fills in" leftovers: whatever comes back is the finished layering,
+    and every consumer in the `decouple` command reads it rather than
+    recomputing anything.
+
+    Returns `(floors, boundary_reasons, provenance)`. `floors` maps node
+    id -> floor; a unit with no path of ANY edge kind to a placed unit is
+    ABSENT (unknown floor), never defaulted to 0. `boundary_reasons` maps
+    each floor-0 boundary node to the `boundary_reason` that put it there.
+    `provenance` maps every placed node to the pass that placed it
+    (`_PROV_BOUNDARY`/`_PROV_CALL`/`_PROV_RESCUE`/`_PROV_PARALLEL`) — the
+    first three are distances measured along call structure, the last is
+    adjacency, and a report that shows them as one number cannot be
+    audited.
 
     Deterministic: `nx.condensation`'s SCC numbering only depends on `G`'s
     own (insertion-ordered) structure, and every set this function iterates
@@ -309,7 +424,7 @@ def compute_floors(G: "nx.DiGraph") -> "tuple[dict[str, int], dict[str, str]]":
         if reason:
             reasons[nid] = reason
     if not reasons:
-        return {}, {}
+        return {}, {}, {}
 
     # Propagated over call-shaped edges only (see _call_structure_only) —
     # boundary detection above still looks at every node's own attributes,
@@ -331,6 +446,10 @@ def compute_floors(G: "nx.DiGraph") -> "tuple[dict[str, int], dict[str, str]]":
 
     seed_sccs = {node_to_scc[n] for n in reasons}
     floors_scc: dict[int, int] = {s: 0 for s in seed_sccs}
+    # Which pass put each SCC on its floor, so a floor can be audited by the
+    # KIND of evidence behind it rather than all three looking alike — see
+    # `compute_floors_with_provenance`.
+    scc_source: dict[int, str] = {s: _PROV_BOUNDARY for s in seed_sccs}
 
     # Cost of each condensed edge = the MAX cost of any underlying edge
     # between those two SCCs. When one SCC is reached from another both by
@@ -395,6 +514,7 @@ def compute_floors(G: "nx.DiGraph") -> "tuple[dict[str, int], dict[str, str]]":
                 candidate = base + scc_edge_cost.get((scc, succ), 1)
                 if succ not in floors_scc or candidate > floors_scc[succ]:
                     floors_scc[succ] = candidate
+                    scc_source[succ] = _PROV_CALL
                     changed = True
         for scc in condensation.nodes:
             if scc in floors_scc:
@@ -405,11 +525,31 @@ def compute_floors(G: "nx.DiGraph") -> "tuple[dict[str, int], dict[str, str]]":
             ]
             if caller_floors:
                 floors_scc[scc] = max(1, min(caller_floors) - 1)
+                scc_source[scc] = _PROV_RESCUE
                 changed = True
 
     floors: dict[str, int] = {
         n: floors_scc[scc] for n, scc in node_to_scc.items() if scc in floors_scc
     }
+    provenance: dict[str, str] = {
+        n: scc_source[node_to_scc[n]] for n in floors
+    }
+
+    # (3) PARALLEL pass — see `_parallel_floors`. Runs here, inside the one
+    # computation, not as a downstream repair: a caller asking for floors
+    # gets the finished layering back, and there is no second, later place
+    # where "unknown" means something different than it does here.
+    for nid, floor in _parallel_floors(G, floors).items():
+        floors[nid] = floor
+        provenance[nid] = _PROV_PARALLEL
+    return floors, reasons, provenance
+
+
+def compute_floors(G: "nx.DiGraph") -> "tuple[dict[str, int], dict[str, str]]":
+    """`compute_floors_with_provenance` without the per-node evidence kind —
+    the two-value form every caller that only needs the layering itself uses.
+    """
+    floors, reasons, _provenance = compute_floors_with_provenance(G)
     return floors, reasons
 
 

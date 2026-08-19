@@ -761,13 +761,25 @@ def decouple_plan(
     """
     from graphify.analyze import god_nodes as _god_nodes
 
-    from graphify.data_floor import class_floor_profile, compute_floors, cross_floor_risk
+    from graphify.data_floor import (
+        class_floor_profile,
+        compute_floors_with_provenance,
+        cross_floor_risk,
+    )
 
-    # Data-flow floors for the whole graph, computed once (longest directed
-    # path from the I/O boundary — see graphify.data_floor). Empty when no boundary is
-    # detectable at all, in which case every entry's floor fields stay
-    # absent rather than defaulting to a fabricated layer.
-    floors, floor_reasons = compute_floors(G)
+    # Data-flow floors for the whole graph, computed ONCE and in full here
+    # — all three passes (see graphify.data_floor), so what comes back is
+    # the finished layering, not a first approximation something downstream
+    # is expected to patch up. Every consumer in the `decouple` command
+    # (the duplicate-function scan's consolidation risk, DECOUPLE_3D.html)
+    # reads the copy attached to the returned plan under `data_floors`
+    # rather than recomputing it, so "unknown floor" means exactly one
+    # thing everywhere the command reports it.
+    #
+    # Empty when no boundary is detectable at all, in which case every
+    # entry's floor fields stay absent rather than defaulting to a
+    # fabricated layer.
+    floors, floor_reasons, floor_provenance = compute_floors_with_provenance(G)
 
     gods = _god_nodes(G, top_n=top_n)
     entries: list[dict[str, Any]] = []
@@ -837,6 +849,19 @@ def decouple_plan(
             "project_root": project_root,
         },
         "god_nodes": entries,
+        # The whole graph's layering, carried so nothing downstream has to
+        # recompute it (and so a report can be audited against the exact
+        # floors that produced its numbers). `provenance` says WHICH pass
+        # placed each unit — "boundary"/"call"/"rescue" are measured along
+        # call structure, "parallel" means the unit was only wired to a
+        # measured one by a non-runtime edge and was placed alongside it at
+        # zero cost. A unit absent from `floors` altogether has no path of
+        # ANY edge kind to a measured one.
+        "data_floors": {
+            "floors": floors,
+            "boundary_reasons": floor_reasons,
+            "provenance": floor_provenance,
+        },
         "caveats": [
             "Member detection uses AST relation edges only (method/contains/defines); "
             "instance fields are not graph nodes for most languages, so this is a "
@@ -896,8 +921,16 @@ def decouple_plan(
             "internals read as three floors of pipeline depth. The honest "
             "limit is the mirror image: a genuinely large module that really "
             "does run several stages internally collapses to one floor. "
-            "Documentation, import and containment edges are excluded "
-            "outright. The "
+            "Documentation, import and containment edges never carry "
+            "DISTANCE — they cannot deepen a floor. They are used for one "
+            "thing only: a unit the call passes could not place at all, but "
+            "which has such an edge to a unit they did place, is put on "
+            "that same floor at zero cost (a parallel placement, see "
+            "data_floor's third pass). This is why 'unknown floor' means a "
+            "unit with no path of ANY edge kind to a measured one, not "
+            "merely one the call graph could not reach; data_floors."
+            "provenance says which pass placed each unit, so a floor taken "
+            "from adjacency is never mistaken for a measured one. The "
             "boundary itself is detected by a NAME heuristic (path tokens + "
             "symbol-name stems), not by actual I/O analysis — it can miss a "
             "boundary hidden behind a domain-flavored name and can flag a "

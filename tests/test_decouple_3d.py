@@ -163,14 +163,20 @@ def test_build_floor_scene_renders_unknown_floor_region_on_a_dedicated_band():
     assert None not in payload["floors"]
 
 
-def test_a_units_real_links_survive_when_its_only_neighbor_has_no_floor():
-    """The actual bug this guards: Known (floor 0, real boundary) connects
-    to Unknown (no boundary reachable at all — an island, and NOT rescuable
-    either, since a `references` edge is not call-shaped and so carries no
-    floor evidence). Since Unknown used to be dropped outright, Known's
-    one real, genuine connection to it vanished from the link set too,
-    making a perfectly normal caller look completely disconnected in the
-    3D view for a reason having nothing to do with its own connectivity."""
+def test_a_unit_wired_only_by_a_non_call_edge_is_placed_parallel_not_unknown():
+    """Known (floor 1) reaches Unknown by a `references` edge only — not
+    call-shaped, so neither the main pass nor the rescue pass can measure a
+    distance to it. It is still WIRED to a measured unit, so it is placed
+    ALONGSIDE that unit (same floor, zero-cost parallel placement) rather
+    than reported as unmeasurable: "unknown" is reserved for a unit with no
+    path of any edge kind to a known floor, which Island below is and this
+    is not.
+
+    Also guards the original bug: an unplaced region used to be dropped
+    outright, which erased every real link to or from it too, making a
+    perfectly normal caller look disconnected for a reason having nothing
+    to do with its own connectivity. Links must survive either way.
+    """
     g = nx.DiGraph()
     _code(g, "boundary", "load_config()", source_file="app/io/thing.py")
     _code(g, "known", "Known", source_file="app/known.py", _callable_class=True)
@@ -182,16 +188,22 @@ def test_a_units_real_links_survive_when_its_only_neighbor_has_no_floor():
     for i in range(3):
         _code(g, f"um{i}", f".m{i}()", source_file="app/isolated.py")
         g.add_edge("unknown", f"um{i}", relation="method", confidence="EXTRACTED")
-    # A real structural edge, but not call-shaped — carries no floor
-    # evidence (for either the main pass or the rescue pass), yet must
-    # still show up as a real link in the 3D view, same as any other edge.
+    # A real structural edge, but not call-shaped: no distance to measure,
+    # yet real evidence that this unit sits alongside a measured one.
     g.add_edge("known_m", "um0", relation="references", confidence="EXTRACTED")
+
+    # Nothing connects to this one at all — the only genuine unknown here.
+    _code(g, "island", "Island", source_file="app/island.py", _callable_class=True)
+    _code(g, "island_m", ".alone()", source_file="app/island.py")
+    g.add_edge("island", "island_m", relation="method", confidence="EXTRACTED")
 
     floors = _floors_for(g)
     positions, discs, region_members = _class_cluster_layout(g)
     payload = build_floor_scene(g, discs, positions, region_members, floors, COMMUNITY_COLORS)
     by_label = {r["label"]: r for r in payload["regions"]}
-    assert by_label["Unknown"]["floor"] is None
+    assert by_label["Known"]["floor"] == 1
+    assert by_label["Unknown"]["floor"] == 1  # parallel to its one neighbor
+    assert by_label["Island"]["floor"] is None  # no edge to any known floor
     pairs = {(l["source"], l["target"]) for l in payload["links"]}
     assert ("known", "unknown") in pairs
 
@@ -364,3 +376,25 @@ def test_write_decouple_3d_html_writes_page_with_before_after_toggle(tmp_path):
     assert "THREE" in html
     assert "decouple-view-cb" in html  # the before/after toggle checkbox
     assert '"state": "after"' in html or '"state":"after"' in html
+
+
+def test_write_decouple_3d_html_uses_the_plans_floors_without_recomputing(tmp_path, monkeypatch):
+    """This view must not run its own floor computation: it would be the
+    second answer to a question the plan already answered, free to
+    disagree with the report it illustrates about which unit is on which
+    floor — or about which units have no floor at all. Blowing up if it is
+    called is the only way to pin that.
+    """
+    import graphify.data_floor as data_floor
+
+    g = _build_graph()
+    communities = {0: ["dm0", "dm1", "dm2"], 1: ["dm3", "dm4", "dm5"]}
+    plan = decouple_plan(g, communities, top_n=10, min_group_size=2)
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("decouple_3d recomputed floors instead of using the plan's")
+
+    monkeypatch.setattr(data_floor, "compute_floors", _boom)
+    monkeypatch.setattr(data_floor, "compute_floors_with_provenance", _boom)
+    out = tmp_path / "DECOUPLE_3D.html"
+    assert write_decouple_3d_html(g, plan, communities, out) == out

@@ -781,3 +781,36 @@ def test_decouple_cli_missing_graph_errors(monkeypatch, tmp_path, capsys):
         _run(monkeypatch, ["graphify", "decouple", "--graph", str(tmp_path / "nope.json")])
     assert exc.value.code == 1
     assert "graph.json not found" in capsys.readouterr().err
+
+
+def test_decouple_plan_carries_the_whole_graphs_floors_computed_once():
+    """The layering is computed ONCE, in full, by decouple_plan, and
+    carried on the plan — the duplicate-function scan's consolidation risk
+    and DECOUPLE_3D.html both read this copy instead of running the same
+    computation again, so "unknown floor" cannot mean one thing in the
+    report and another in the view. `provenance` is what keeps a floor
+    taken from adjacency ("parallel") auditable next to a measured one:
+    `helper` here is wired to the parser by an `imports` edge and nothing
+    else, so it is placed alongside it rather than left unmeasured.
+    """
+    g = nx.DiGraph()
+    g.add_node("parser", label="Parser", file_type="code", _callable_class=True,
+               source_file="app/io/parser.py", source_location="L1")
+    _add_member(g, "parser", "p_load", label=".load_file()", source_file="app/io/parser.py")
+    g.add_node("engine", label="Engine", file_type="code", _callable_class=True,
+               source_file="app/core/engine.py", source_location="L1")
+    _add_member(g, "engine", "e_run", label=".run()", source_file="app/core/engine.py")
+    g.add_edge("e_run", "p_load", relation="calls", confidence="EXTRACTED")
+    g.add_node("helper", label="Helper", file_type="code", _callable_class=True,
+               source_file="app/util/helper.py", source_location="L1")
+    g.add_edge("helper", "parser", relation="imports", confidence="EXTRACTED")
+
+    plan = decouple_plan(g, {0: ["p_load"], 1: ["e_run"]}, top_n=10, min_group_size=1)
+    floors = plan["data_floors"]["floors"]
+    provenance = plan["data_floors"]["provenance"]
+    assert floors["p_load"] == 0
+    assert floors["e_run"] == 1
+    assert provenance["helper"] == "parallel"
+    assert floors["helper"] == 0  # alongside the parser, not one floor below
+    assert set(provenance) == set(floors)
+    assert set(plan["data_floors"]["boundary_reasons"]) <= set(floors)

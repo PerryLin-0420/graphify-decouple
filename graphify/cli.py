@@ -2341,7 +2341,6 @@ def dispatch_command(cmd: str) -> None:
         # when explicitly disabled.
         dedup_report: "dict[str, Any] | None" = None
         if not no_dedup and resolved_root is not None:
-            from graphify.data_floor import compute_floors
             from graphify.decouple import annotate_consolidation_risk
             from graphify.tool_dedup import discover_source_files, find_duplicate_function_clusters
             dedup_files = discover_source_files(resolved_root)
@@ -2352,7 +2351,12 @@ def dispatch_command(cmd: str) -> None:
             # never mixed into a god node's risk_before/risk_after (a
             # merge's cost/benefit is answered at corpus scale, a split's
             # at single-class scale).
-            floors, _floor_reasons = compute_floors(G)
+            # The plan's own floors, not a second run of the same
+            # computation: decouple_plan already computed the whole
+            # layering (all three passes) and carries it, so the merge
+            # verdicts here are scored against the exact floors the split
+            # verdicts and DECOUPLE_3D.html use.
+            floors = plan["data_floors"]["floors"]
             dedup_report = annotate_consolidation_risk(G, dedup_report, floors)
         elif not no_dedup:
             print("skipping duplicate-function scan: no project root resolved (see --no-state-check/--project-root)", file=sys.stderr)
@@ -2389,7 +2393,12 @@ def dispatch_command(cmd: str) -> None:
             if written:
                 print(f"wrote {written}")
             else:
-                print("skipping DECOUPLE_3D.html: no I/O-boundary floor detected in this graph", file=sys.stderr)
+                print(
+                    "skipping DECOUPLE_3D.html: nothing to stack — either no I/O boundary "
+                    "was detected in this graph, or it has no class/module region to place "
+                    "on a floor",
+                    file=sys.stderr,
+                )
         god_entries = [e for e in plan["god_nodes"] if e["classification"] == "god_object"]
         n_hub = sum(1 for e in plan["god_nodes"] if e["classification"] == "over_referenced_hub")
         n_cohesive = len(plan["god_nodes"]) - len(god_entries) - n_hub
