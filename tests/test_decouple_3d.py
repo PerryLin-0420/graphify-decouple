@@ -229,7 +229,19 @@ def test_proposed_group_regions_only_for_recommended_splits():
 
 def test_proposed_group_regions_get_their_own_floor_not_the_original_class():
     """The entire point: a proposed group's floor is computed from ITS OWN
-    members, independently of the original class's dominant floor."""
+    edges to things OUTSIDE the original class (`hypothetical_group_floor`
+    — see decouple_plan's attachment comment), not from a majority vote
+    over its members' pre-split (region-uniform) floor. Group A (dm0-dm2)
+    has a genuine edge out to the Loader (floor 0), so it resolves to
+    floor 1 on its own. Group B (dm3-dm5) has NO edge outside the original
+    class at all — its only departure point is a call to dm2, a SIBLING
+    (group A) still nominally inside the same class — so it is unresolved
+    on the first pass, and only lands on floor 2 once the fixed-point
+    iteration lets it use group A's NOW-DECIDED floor as external evidence
+    (a real split makes calling a sibling group a genuine cross-class
+    hop). Both are DIFFERENT from what a per-member vote over the ORIGINAL
+    class's one shared region floor would give — that number cannot tell
+    the two groups apart at all, which is exactly why this exists."""
     g = _build_graph()
     communities = {0: ["lm0", "lm1", "lm2"], 1: ["dm0", "dm1", "dm2"], 2: ["dm3", "dm4", "dm5"]}
     plan = decouple_plan(g, communities, top_n=20, min_group_size=1)
@@ -237,9 +249,11 @@ def test_proposed_group_regions_get_their_own_floor_not_the_original_class():
     _positions, discs, _region_members = _class_cluster_layout(g)
     after, _member_to_after_region = _proposed_group_regions(g, plan, discs, _positions, floors)
     assert after, "expected at least one proposed group region in this fixture"
+    group_a = next(r for r in after if set(m["label"] for m in r["members"]) & {".dm0()"})
+    group_b = next(r for r in after if set(m["label"] for m in r["members"]) & {".dm3()"})
+    assert group_a["floor"] == 1
+    assert group_b["floor"] == 2  # one hop past group A, resolved via the sibling chain
     for r in after:
-        member_floors = [m["floor"] for m in r["members"]]
-        assert r["floor"] in member_floors  # dominant floor came from ITS OWN members
         assert r["state"] == "after"
 
 

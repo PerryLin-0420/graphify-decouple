@@ -228,7 +228,11 @@ def _neighbors(G: nx.Graph, n: str) -> set:
     return set(G.neighbors(n))
 
 
-def _parallel_floors(G: nx.Graph, floors: dict[str, int]) -> dict[str, int]:
+def _parallel_floors(
+    G: nx.Graph,
+    floors: dict[str, int],
+    region_of: "dict[str, str] | None" = None,
+) -> dict[str, int]:
     """Floors for units the CALL passes could not place, taken from a
     non-runtime edge to a unit they could — the third and last pass of
     `compute_floors_with_provenance`.
@@ -269,27 +273,61 @@ def _parallel_floors(G: nx.Graph, floors: dict[str, int]) -> dict[str, int]:
     relaying a floor between two unrelated code units through the docstring
     that happens to mention both.
 
+    `region_of`, when given, runs this pass at REGION granularity instead
+    of per-node: every member of a region is placed together (a region
+    with no measured floor of its own, but wired by ANY edge kind to a
+    PLACED region, is placed alongside that region as a WHOLE, not
+    node-by-node) — the same reason `compute_floors_with_provenance`
+    contracts by region for the call/rescue passes: a class is one unit,
+    and this pass must not let two of its own members disagree about which
+    neighbor's floor they inherited just because the BFS happened to reach
+    them from different directions. A region is eligible for placement
+    only if at least one of its members is `file_type == "code"`.
+
     What is left with no floor after this pass is the honest remainder: a
     unit with no path of ANY edge kind to anything whose floor is known —
     genuinely unmeasured, not merely unmeasured by call structure.
     """
     if not floors:
         return {}
+    unit_of = (lambda n: region_of.get(n, n)) if region_of else (lambda n: n)
+    # A unit's floor, seeded from whichever of its members already has one
+    # — every member of an already-placed region shares that floor by
+    # construction (region_of came out of the SAME contraction the
+    # call/rescue passes used), so any one of them determines it.
+    unit_floor: dict[str, int] = {}
+    for n, f in floors.items():
+        unit_floor.setdefault(unit_of(n), f)
+    members_of: dict[str, list[str]] = {}
+    has_code: dict[str, bool] = {}
+    for n in G.nodes:
+        u = unit_of(n)
+        members_of.setdefault(u, []).append(n)
+        if G.nodes[n].get("file_type") == "code":
+            has_code[u] = True
     assigned: dict[str, int] = {}
-    placed = set(floors)
-    for level in sorted(set(floors.values())):
+    placed = set(unit_floor)
+    for level in sorted(set(unit_floor.values())):
         # Sorted at every step: the result must not depend on dict order.
-        queue = sorted(n for n in floors if floors[n] == level)
+        queue = sorted(u for u in unit_floor if unit_floor[u] == level)
         while queue:
             cur = queue.pop(0)
-            for nb in sorted(_neighbors(G, cur)):
-                if nb in placed or nb in assigned:
+            neighbor_units = set()
+            for n in members_of.get(cur, ()):
+                for nb in _neighbors(G, n):
+                    neighbor_units.add(unit_of(nb))
+            for nu in sorted(neighbor_units):
+                if nu in placed or nu in assigned:
                     continue
-                if G.nodes[nb].get("file_type") != "code":
+                if not has_code.get(nu):
                     continue
-                assigned[nb] = level
-                queue.append(nb)
-    return assigned
+                assigned[nu] = level
+                queue.append(nu)
+    result: dict[str, int] = {}
+    for u, level in assigned.items():
+        for n in members_of.get(u, ()):
+            result[n] = level
+    return result
 
 
 def _same_module(G: nx.Graph, u: str, v: str) -> bool:
@@ -339,6 +377,55 @@ def _call_structure_only(G: nx.DiGraph) -> nx.DiGraph:
     return H
 
 
+def _contract_by_region(call_graph: nx.DiGraph, region_of: "dict[str, str]") -> nx.DiGraph:
+    """`call_graph`, with every node replaced by `region_of.get(n, n)` —
+    a class or module region collapsed to ONE node, the same idea as SCC
+    condensation, but for CONTAINMENT rather than cycles.
+
+    Exists because zero-cost `method` propagation alone is not enough to
+    make "a function belongs to its class" true for floor purposes. A
+    class with many methods at different depths lets its own node inherit
+    the DEEPEST one via the zero-cost edge (see the module docstring's
+    "route through a class node" case) — correct when there is one
+    obvious path, wrong when it means "constructing this class" inherits
+    the depth of some rarely-called callback the constructor never
+    touches. Measured on a real corpus (AutoCheck): `GroupAnalyzeDialog`
+    has 34 methods, 19 of them at floor 1 and one — a correlation-analysis
+    button handler — reaching floor 3 through three more classes. Under
+    per-node floors, the class's OWN node inherited that outlier (floor 3),
+    so a test merely constructing the dialog was measured at floor 4, while
+    the SAME class's region in the 3D view displayed floor 1 (the
+    DOMINANT vote over its members) — two different numbers for one class,
+    and neither matched what was actually drawn: a floor-4 disc linked to
+    a floor-1 disc with nothing at floors 2–3 to explain the jump.
+
+    Contracting every member into one node BEFORE the DP runs removes the
+    ambiguity: every member of a region shares the exact same floor by
+    construction, and that floor is 1 + the deepest thing ANY of the
+    region's members reaches OUTSIDE it — the same DP rule as always,
+    applied at the granularity where data actually changes hands (a class
+    or module), not at the granularity code happens to be split into
+    (individual functions).
+
+    An edge whose two ends land in the SAME region (an intra-class or
+    intra-module call, or the `method` edge itself) is dropped — it is
+    now literally a self-loop, no distance to measure. A node absent from
+    `region_of` is its own singleton region, so passing `region_of=None`-
+    equivalent (an empty or partial mapping) leaves it exactly as
+    `call_graph` already had it.
+    """
+    H = nx.DiGraph()
+    H.add_nodes_from({region_of.get(n, n) for n in call_graph.nodes})
+    for u, v, data in call_graph.edges(data=True):
+        ru, rv = region_of.get(u, u), region_of.get(v, v)
+        if ru == rv:
+            continue
+        cost = data["cost"]
+        if not H.has_edge(ru, rv) or cost > H.edges[ru, rv]["cost"]:
+            H.add_edge(ru, rv, cost=cost)
+    return H
+
+
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -375,6 +462,7 @@ def boundary_reason(G: nx.Graph, node_id: str) -> "str | None":
 
 def compute_floors_with_provenance(
     G: "nx.DiGraph",
+    region_of: "dict[str, str] | None" = None,
 ) -> "tuple[dict[str, int], dict[str, str], dict[str, str]]":
     """Longest directed-path distance (hops) from the nearest I/O boundary
     node, computed on `G`'s strongly-connected-component condensation —
@@ -417,6 +505,30 @@ def compute_floors_with_provenance(
     Requires a DIRECTED `G` — `nx.condensation` (and "longest path" itself,
     which needs a direction to be long ALONG) are undefined for an
     undirected graph.
+
+    `region_of`, when given, maps every node to the class/module region it
+    belongs to (the same partition `decouple._region_membership` computes)
+    and contracts every region to ONE unit before any of the three passes
+    run — see `_contract_by_region`. Every member of a region then shares
+    the exact same floor, because a function is CONTAINED by its class,
+    not a separate stage of the data flow: without this, a class with many
+    methods at very different depths let its own node inherit its single
+    DEEPEST member via the zero-cost `method` edge (see the module
+    docstring's "route through a class" case), so a caller merely
+    referencing the class (a constructor call) inherited the depth of a
+    method it never actually invokes. Measured on a real corpus
+    (AutoCheck): a class with 34 methods, 19 at floor 1 and one — a rare
+    callback — reaching floor 3 through three more classes, had its own
+    node measured at floor 3 (so a test merely constructing it landed at
+    floor 4) while the 3D view displayed the SAME class's region at floor
+    1 (the majority vote over its members) — two different numbers for
+    one unit, and neither matched the actual drawn links. Contracting
+    first removes the ambiguity: a region's floor is 1 + the deepest thing
+    ANY of its members reaches OUTSIDE the region, and every member — and
+    every OTHER unit that references the region — sees that one number.
+    Omit `region_of` (or pass an empty/partial mapping) to get the
+    per-node floors exactly as before; a node absent from the mapping is
+    its own singleton region either way.
     """
     reasons: dict[str, str] = {}
     for nid in sorted(G.nodes):
@@ -431,6 +543,8 @@ def compute_floors_with_provenance(
     # regardless of what kind of edges connect it, but a hop only counts
     # when it is an actual invocation.
     call_graph = _call_structure_only(G)
+    if region_of:
+        call_graph = _contract_by_region(call_graph, region_of)
 
     # Condensed on the REVERSED graph, not call_graph itself: a call edge
     # (u, v) means "u calls v", i.e. v is closer to the boundary than u is
@@ -444,7 +558,34 @@ def compute_floors_with_provenance(
     condensation = nx.condensation(call_graph.reverse(copy=False))
     node_to_scc: dict[str, int] = condensation.graph["mapping"]
 
-    seed_sccs = {node_to_scc[n] for n in reasons}
+    _unit = (lambda n: region_of.get(n, n)) if region_of else (lambda n: n)
+    # A CLASS-shaped region's boundary status is judged by the CLASS's OWN
+    # identity (its own label + file, via boundary_reason on the class
+    # node itself) — never by one of its individual MEMBERS matching a
+    # name token, because contraction now means that ONE match seeds the
+    # WHOLE class, not just that one method. Measured on a real corpus
+    # (AutoCheck): `GroupAnalyzeDialog` has 34 methods; five of them —
+    # UI callbacks named `_on_save`, `_select_all_files`,
+    # `_open_chart_properties`, `_sync_props_panel`, `_on_file_item_clicked`
+    # — coincidentally match `_BOUNDARY_NAME_TOKENS` ("save", "select",
+    # "open", "sync", "file") despite being button handlers, not I/O. Under
+    # per-node floors this was an isolated false positive on one method;
+    # under region-contraction it collapsed the entire 34-method class
+    # (including a member genuinely measured at floor 3 via a real 3-hop
+    # chain) to floor 0. The class's OWN node ("GroupAnalyzeDialog", file
+    # "group_analyze_dialog.py") does not itself match any boundary token,
+    # so requiring the region's OWN identity to agree — not merely
+    # tolerating a stray member's — correctly leaves this class to be
+    # measured by its real calls instead. A module/external region has no
+    # single node to ask this of, so it keeps the "any member" rule those
+    # were always seeded by.
+    seed_units: set[str] = set()
+    for n in reasons:
+        unit = _unit(n)
+        if region_of and unit != n and unit in G.nodes and G.nodes[unit].get("_callable_class"):
+            continue  # a member's own reason does not seed its class
+        seed_units.add(unit)
+    seed_sccs = {node_to_scc[u] for u in seed_units}
     floors_scc: dict[int, int] = {s: 0 for s in seed_sccs}
     # Which pass put each SCC on its floor, so a floor can be audited by the
     # KIND of evidence behind it rather than all three looking alike — see
@@ -528,29 +669,114 @@ def compute_floors_with_provenance(
                 scc_source[scc] = _PROV_RESCUE
                 changed = True
 
-    floors: dict[str, int] = {
-        n: floors_scc[scc] for n, scc in node_to_scc.items() if scc in floors_scc
-    }
-    provenance: dict[str, str] = {
-        n: scc_source[node_to_scc[n]] for n in floors
-    }
+    # Expanded from the (possibly region-contracted) SCC graph to every
+    # ORIGINAL node in G: with `region_of`, `node_to_scc` is keyed by
+    # region ids, not by every node, so each node reads its OWN unit's
+    # result rather than being looked up directly.
+    floors: dict[str, int] = {}
+    provenance: dict[str, str] = {}
+    for n in G.nodes:
+        unit = _unit(n)
+        scc = node_to_scc.get(unit)
+        if scc is None or scc not in floors_scc:
+            continue
+        floors[n] = floors_scc[scc]
+        provenance[n] = scc_source[scc]
 
     # (3) PARALLEL pass — see `_parallel_floors`. Runs here, inside the one
     # computation, not as a downstream repair: a caller asking for floors
     # gets the finished layering back, and there is no second, later place
     # where "unknown" means something different than it does here.
-    for nid, floor in _parallel_floors(G, floors).items():
+    for nid, floor in _parallel_floors(G, floors, region_of=region_of).items():
         floors[nid] = floor
         provenance[nid] = _PROV_PARALLEL
     return floors, reasons, provenance
 
 
-def compute_floors(G: "nx.DiGraph") -> "tuple[dict[str, int], dict[str, str]]":
+def compute_floors(
+    G: "nx.DiGraph",
+    region_of: "dict[str, str] | None" = None,
+) -> "tuple[dict[str, int], dict[str, str]]":
     """`compute_floors_with_provenance` without the per-node evidence kind —
     the two-value form every caller that only needs the layering itself uses.
     """
-    floors, reasons, _provenance = compute_floors_with_provenance(G)
+    floors, reasons, _provenance = compute_floors_with_provenance(G, region_of=region_of)
     return floors, reasons
+
+
+def hypothetical_group_floor(
+    G: nx.Graph,
+    members: list[str],
+    floors: dict[str, int],
+    exclude: "set[str]",
+) -> "int | None":
+    """The floor a PROPOSED group of `members` would occupy if it were
+    actually extracted into its own region, separate from the class it
+    currently lives in — used by `decouple.split_risk_score` to ask
+    whether a split would put its resulting groups on DIFFERENT floors,
+    without re-running the corpus's whole floor computation.
+
+    Under region-granularity floors (`compute_floors_with_provenance`'s
+    `region_of`), every member of an UNSPLIT class shares the exact same
+    floor by construction — that IS what "a function is contained by its
+    class" means for this purpose. So a proposed group's members, before
+    the split has actually happened, all still carry the ORIGINAL class's
+    one number; there is no "do the group's OWN members disagree" signal
+    left to read (that information was correctly destroyed by
+    contraction). The question worth answering moved: not "does this
+    group internally span floors" but "would EXTRACTING it land somewhere
+    its siblings are not".
+
+    So this computes the group's floor the same way `compute_floors_with_
+    provenance`'s two call-structure passes would if the group were its
+    own region, scoped to its own boundary:
+      - MAIN: 1 + the deepest floor reached by an edge FROM a group member
+        TO something outside `exclude` ("how deep is what I call").
+      - RESCUE, only if MAIN found nothing: the shallowest floor among
+        callers INTO the group from outside `exclude`, minus one ("how
+        shallow is whoever constructs me").
+      - Neither: the group has no evidence of its own — absent, not a
+        guess (same "unknown means unknown" discipline as everywhere else
+        in this module).
+
+    `exclude` is every OTHER member of the SAME original class, including
+    sibling proposed groups: a call to one of THOSE is not yet a
+    cross-region hop, because the split has not actually happened, and
+    `split_risk_score` already scores cross-group coupling as its own,
+    separate term (`cross_group_edges`) — this function does not try to
+    re-derive that here, only what the group depends on genuinely outside
+    its current class.
+    """
+    best_out: "int | None" = None
+    best_in: "int | None" = None
+    member_set = set(members)
+    directed = G.is_directed()
+    for m in sorted(members):
+        if m not in G.nodes:
+            continue
+        for v in sorted(G.successors(m) if directed else G.neighbors(m)):
+            if v in exclude or v in member_set or v not in floors:
+                continue
+            cost = _HOP_COST.get(G.edges[m, v].get("relation"))
+            if cost is None:
+                continue
+            candidate = floors[v] + cost
+            if best_out is None or candidate > best_out:
+                best_out = candidate
+        if not directed:
+            continue
+        for u in sorted(G.predecessors(m)):
+            if u in exclude or u in member_set or u not in floors:
+                continue
+            if _HOP_COST.get(G.edges[u, m].get("relation")) is None:
+                continue
+            if best_in is None or floors[u] < best_in:
+                best_in = floors[u]
+    if best_out is not None:
+        return best_out
+    if best_in is not None:
+        return max(1, best_in - 1)
+    return None
 
 
 def class_floor_profile(

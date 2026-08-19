@@ -371,9 +371,9 @@ _SPLIT_GROUP_CAP = 5           # new classes - 1 >= this maxes the "group overhe
 _STATE_OVERLAP_ADD_WEIGHT = 0.6  # extra risk points ADDED (not blended) at 100% state overlap
 _CROSS_FLOOR_ADD_WEIGHT = 0.35   # fraction of data_floor.cross_floor_risk ADDED to the
                                  # CURRENT-risk score — see original_risk_score
-_GROUP_FLOOR_ADD_WEIGHT = 0.3    # fraction of the worst PROPOSED GROUP's own
-                                 # cross_floor_risk ADDED to split_risk_score — see
-                                 # that function's docstring
+_GROUP_FLOOR_ADD_WEIGHT = 0.3    # fraction of the PROPOSED GROUPS' cross-group
+                                 # floor spread's cross_floor_risk ADDED to
+                                 # split_risk_score — see that function's docstring
 _ACYCLIC_EDGE_DISCOUNT = 0.5   # halves the cross-group-edge component when proposed groups'
                                # dependencies form a DAG (delegating/pipeline) instead of a
                                # cycle — see split_risk_score's "group_dependency_shape"
@@ -496,23 +496,30 @@ def split_risk_score(
       methods, didn't reduce the coupling" failure mode. Also NOT discounted
       by `group_dependency_shape`: shared instance state is a cost whether
       the calls between the groups are one-way or mutual.
-    - `max_group_floor_risk` (only when a group in `groups` carries a
-      `floor_profile` — attached by `decouple_plan`, see
-      `graphify.data_floor`, BEFORE this function is called; this function
-      never computes floors itself): the worst
-      `data_floor.cross_floor_risk` among the proposed groups' OWN member
-      floors. A split grouped by community/coupling optimizes for a
-      DIFFERENT axis than floor-coherence — a "recommended" split can
-      still leave one or more resulting groups straddling the same several
-      data-flow stages the original class did. This is ADDITIVE, same
-      reasoning as the state-overlap term: crossing floors is bad news
-      independent of how clean the call-graph shape looks, so a second bad
-      signal must only ever reveal MORE risk. It does not veto a split —
-      the weight (`_GROUP_FLOOR_ADD_WEIGHT`) is deliberately a fraction,
-      not the whole 100, so a split can still net-benefit despite some
-      residual floor-crossing if the coupling reduction is large enough.
-      Absent (skipped) when no proposed group has a determinable floor —
-      an unknown, never scored as if verified floor-coherent.
+    - `max_group_floor_risk` (only when at least one group in `groups`
+      carries a `floor_profile` — attached by `decouple_plan` via
+      `data_floor.hypothetical_group_floor`, BEFORE this function is
+      called; this function never computes floors itself): under
+      region-granularity floors (`compute_floors_with_provenance`'s
+      `region_of`), every member of this STILL-UNSPLIT class shares one
+      floor by construction — a function is contained by its class, not a
+      separate data-flow stage — so there is no "do this group's OWN
+      members disagree" signal left to read; that question only makes
+      sense once a split is on the table. What this measures instead is
+      `data_floor.cross_floor_risk` on the SPREAD ACROSS the proposed
+      groups' OWN hypothetical floors (where each would land if actually
+      extracted): a split grouped by community/coupling optimizes for a
+      DIFFERENT axis than floor-coherence, and "recommended" is not a
+      guarantee the resulting groups end up on the SAME data-flow stage as
+      each other. This is ADDITIVE, same reasoning as the state-overlap
+      term: crossing floors is bad news independent of how clean the
+      call-graph shape looks, so a second bad signal must only ever reveal
+      MORE risk. It does not veto a split — the weight
+      (`_GROUP_FLOOR_ADD_WEIGHT`) is deliberately a fraction, not the
+      whole 100, so a split can still net-benefit despite some residual
+      floor-crossing if the coupling reduction is large enough. Absent
+      (skipped) when no proposed group has an edge to anything outside
+      this class — an unknown, never scored as if floor-coherent.
 
     A single non-residual group (nothing left to compare against) has no
     split risk by construction — there is no second class to be coupled to.
@@ -595,20 +602,35 @@ def split_risk_score(
     else:
         state_analysis = "skipped (no project_root given, unsupported language, or source unreadable)"
 
-    # group_floor_profile is attached by decouple_plan (graphify.data_floor),
-    # BEFORE this function runs — never recomputed here. A group missing it
-    # (no boundary reachable, or no member had a determinable floor) is
-    # simply absent from `group_profiles`, not treated as floor-coherent.
+    # Each group's own hypothetical floor (`hypothetical_group_floor`) is
+    # attached by decouple_plan, BEFORE this function runs — never
+    # recomputed here. Under region-granularity floors, a group's OWN
+    # floor_profile always has floor_span==0 (see decouple_plan's
+    # attachment comment: it is ONE number, the group's own estimate) —
+    # the risk signal worth scoring here is not any single group's
+    # internal span, it is whether the groups THIS SPLIT PROPOSES would
+    # land on DIFFERENT floors from EACH OTHER: a split grouped by
+    # community/coupling optimizes for a different axis than floor-
+    # coherence, and "recommended" is not a guarantee the result sits on
+    # one data-flow stage. A group missing a floor_profile (no edge to
+    # anything outside this class) is simply absent from `group_floors`,
+    # not treated as floor-coherent.
     from graphify.data_floor import cross_floor_risk as _cross_floor_risk
 
-    group_profiles = [g["floor_profile"] for g in non_residual if g.get("floor_profile")]
-    if group_profiles:
-        max_group_floor_risk = max(_cross_floor_risk(p) for p in group_profiles)
+    group_floors = [
+        g["floor_profile"]["floor"] for g in non_residual if g.get("floor_profile")
+    ]
+    if group_floors:
+        span_profile = {
+            "floor_span": max(group_floors) - min(group_floors),
+            "floor_evidence": round(len(group_floors) / len(non_residual), 2),
+        }
+        max_group_floor_risk = _cross_floor_risk(span_profile)
         score = min(100.0, score + _GROUP_FLOOR_ADD_WEIGHT * max_group_floor_risk)
         group_floor_analysis = "ok"
     else:
         max_group_floor_risk = None
-        group_floor_analysis = "skipped (no I/O boundary reachable, or no proposed group had a determinable floor)"
+        group_floor_analysis = "skipped (no proposed group had an edge to anything outside this class)"
 
     return {
         "n_new_classes": len(non_residual),
@@ -767,6 +789,21 @@ def decouple_plan(
         cross_floor_risk,
     )
 
+    # Every node's class/module/external region — computed ONCE, here,
+    # cheaply (no disc-packing, just the partition; see
+    # `_region_membership`) and fed into the floor computation below so a
+    # function's floor is its CLASS's floor, not something measured
+    # independently per method. A class with many methods at different
+    # depths used to let its own node inherit its single DEEPEST member
+    # via the zero-cost `method` edge (a caller merely constructing the
+    # class inherited the depth of a method it never invokes), while the
+    # SAME class's region in the 3D view displayed a DIFFERENT number (the
+    # majority vote over its members) — two numbers for one unit, matching
+    # neither the class's real behavior nor what was actually drawn. See
+    # `data_floor.compute_floors_with_provenance`'s `region_of` docstring
+    # for the measured AutoCheck example.
+    _region_members, region_of = _region_membership(G)
+
     # Data-flow floors for the whole graph, computed ONCE and in full here
     # — all three passes (see graphify.data_floor), so what comes back is
     # the finished layering, not a first approximation something downstream
@@ -779,7 +816,7 @@ def decouple_plan(
     # Empty when no boundary is detectable at all, in which case every
     # entry's floor fields stay absent rather than defaulting to a
     # fabricated layer.
-    floors, floor_reasons, floor_provenance = compute_floors_with_provenance(G)
+    floors, floor_reasons, floor_provenance = compute_floors_with_provenance(G, region_of=region_of)
     # Nodes whose floor was MEASURED along call structure, as opposed to
     # placed alongside a neighbor by the parallel pass. Every profile below
     # is decided by these alone wherever a unit has any, so adjacency can
@@ -813,19 +850,69 @@ def decouple_plan(
                 G, info["members"], communities, community_labels,
                 min_group_size=min_group_size,
             )
-            # Each non-residual group's OWN floor profile, attached HERE —
-            # the single place it is computed. split_risk_score reads it
-            # (never recomputes it) to score whether the split actually
-            # resolves cross-floor spread; render_markdown/decouple.json
-            # carry it for reporting; decouple_3d.py reads the SAME
-            # attached value again for its before/after view — nothing
-            # downstream of decouple_plan recomputes floors from scratch.
+            # Each non-residual group's OWN floor, attached HERE — the
+            # single place it is computed. Under region-granularity floors
+            # every member of this STILL-UNSPLIT class shares one number
+            # (see compute_floors_with_provenance's region_of docstring),
+            # so class_floor_profile's majority vote would be trivially
+            # uniform across every group and say nothing — the real
+            # question is "where would this group land if it were actually
+            # extracted", which `hypothetical_group_floor` answers by
+            # looking at the group's OWN edges to everything OUTSIDE this
+            # class.
+            #
+            # Resolved as a FIXED POINT across this split's OWN groups, not
+            # independently: a group that only calls a SIBLING group (both
+            # still nominally part of the same unsplit class) has no
+            # external anchor of its own on the first pass, but once that
+            # sibling resolves, it genuinely IS external evidence — after a
+            # real split, calling a sibling group is a cross-class hop,
+            # exactly like calling anything else outside the original
+            # class. Each group that resolves has its members' floor
+            # OVERRIDDEN (in a local copy, not `floors` itself) to its own
+            # hypothetical value and released from `exclude`, so the next
+            # round can use it; residual members (not part of any proposed
+            # group) stay excluded throughout — they are not being
+            # extracted, so they remain "the same still-existing class".
+            # Same fixed-point shape as data_floor's rescue pass, scoped to
+            # one split. split_risk_score reads the result (never
+            # recomputes it) to score whether the groups this split
+            # proposes would end up on DIFFERENT floors from each other;
+            # render_markdown/decouple.json carry it for reporting;
+            # decouple_3d.py reads the SAME attached value again for its
+            # before/after view.
             if floors:
-                for g in groups:
-                    if g["community_id"] is not None:
-                        g["floor_profile"] = class_floor_profile(
-                            G, None, g["members"], floors, measured=measured_floors,
+                from graphify.data_floor import hypothetical_group_floor
+
+                exclude_class = set(info["members"]) | {node_id}
+                floors_local = dict(floors)
+                pending = [g for g in groups if g["community_id"] is not None]
+                changed = True
+                while changed and pending:
+                    changed = False
+                    still_pending = []
+                    for g in pending:
+                        group_floor = hypothetical_group_floor(
+                            G, g["members"], floors_local, exclude=exclude_class,
                         )
+                        if group_floor is None:
+                            still_pending.append(g)
+                            continue
+                        g["floor_profile"] = {
+                            "floor": group_floor,
+                            "floor_basis": "hypothetical",
+                            "min_floor": group_floor,
+                            "max_floor": group_floor,
+                            "floor_span": 0,
+                            "members_with_known_floor": len(g["members"]),
+                            "members_total": len(g["members"]),
+                            "floor_evidence": 1.0,
+                        }
+                        for m in g["members"]:
+                            floors_local[m] = group_floor
+                        exclude_class -= set(g["members"])
+                        changed = True
+                    pending = still_pending
             info["proposed_groups"] = groups
             risk_before = original_risk_score(info)
             non_residual = [gr for gr in groups if gr["community_id"] is not None]
@@ -951,30 +1038,42 @@ def decouple_plan(
             "class that calls a floor-0 boundary is floor 1, whatever calls "
             "that class is floor 2, and so on) — call direction is who-"
             "invokes-whom, which is not the same as which way data moves, "
-            "but it is the only direction available to measure along. A "
-            "class with no floor_profile was NOT measured (no boundary "
-            "reachable), which is not the same as sitting on a single floor "
-            "— its risk_before carries no cross-floor term either way. "
-            "cross_floor_risk is scaled by floor_evidence (the share of the "
-            "unit's members with a known floor), because span and evidence "
-            "are inversely related on real graphs — a handful of scattered "
-            "known-floor points among many unknowns can produce a large span "
-            "on thin evidence, while a fully-measured unit usually turns out "
-            "to sit on one floor. A span measured over 25% of members scores "
-            "a quarter of what the same span scores when every member is "
-            "known, so the weakest evidence cannot produce the strongest "
-            "penalty.",
-            "Each proposed group ALSO gets its own floor_profile (attached "
-            "once, here, and read — never recomputed — by split_risk_score "
-            "and by decouple_3d.py's before/after view). max_group_floor_risk "
-            "in a split's detail is the worst one, added into that split's "
-            "score at a fraction (_GROUP_FLOOR_ADD_WEIGHT) of full weight — "
-            "grouping by community/coupling optimizes for a DIFFERENT axis "
-            "than floor-coherence, so a 'recommended' split is not "
-            "guaranteed to leave every resulting group on a single floor; "
-            "this makes that visible in the number instead of assumed. It "
-            "is a weighted cost, not a veto — a split can still net-benefit "
-            "despite some residual floor-crossing.",
+            "but it is the only direction available to measure along. "
+            "Floors are computed at CLASS/MODULE granularity, not per "
+            "function (`compute_floors_with_provenance`'s `region_of`): "
+            "every method of one class shares the exact same floor by "
+            "construction, because a function is CONTAINED by its class, "
+            "not a separate stage of the data flow — a class's floor is 1 + "
+            "the deepest thing ANY of its own methods reaches. This means a "
+            "STILL-UNSPLIT class's floor_profile always has floor_span==0 "
+            "(there is nothing left to disagree — every member reports the "
+            "SAME number) and floor_risk is always 0.0 for the class as it "
+            "currently stands; span only becomes a meaningful question once "
+            "a SPLIT is on the table (see the proposed-group paragraph "
+            "below). A class with no floor_profile at all was NOT measured "
+            "(no boundary reachable from it, and no edge to a measured "
+            "region either) — its risk_before carries no cross-floor term "
+            "either way.",
+            "Each proposed group gets its OWN floor via "
+            "`data_floor.hypothetical_group_floor` (attached once, here, "
+            "and read — never recomputed — by split_risk_score and by "
+            "decouple_3d.py's before/after view): where the group would "
+            "land if it were actually extracted into its own region, based "
+            "on its own edges to everything OUTSIDE the original class (a "
+            "call to a sibling group doesn't count — the split hasn't "
+            "happened yet, and cross-group coupling is scored separately as "
+            "`cross_group_edges`). max_group_floor_risk in a split's detail "
+            "is `cross_floor_risk` on the SPREAD ACROSS the proposed "
+            "groups' own floors — do they land on DIFFERENT floors from "
+            "EACH OTHER — added into that split's score at a fraction "
+            "(_GROUP_FLOOR_ADD_WEIGHT) of full weight: grouping by "
+            "community/coupling optimizes for a DIFFERENT axis than "
+            "floor-coherence, so a 'recommended' split is not guaranteed to "
+            "leave every resulting group on the SAME data-flow stage as its "
+            "siblings; this makes that visible in the number instead of "
+            "assumed. It is a weighted cost, not a veto — a split can still "
+            "net-benefit despite some residual floor-crossing. Absent when "
+            "no proposed group has an edge to anything outside the class.",
         ],
     }
 
@@ -1027,7 +1126,18 @@ def _pack_discs(sizes: list[tuple[str, float]]) -> dict[str, tuple[float, float]
 
     placed: list[tuple[float, float, float]] = []
     out: dict[str, tuple[float, float]] = {}
-    gap = 60.0  # visual breathing room between two hull edges
+    # Visual breathing room between two hull edges. Every node now belongs
+    # to SOME region (see _region_membership), which on a real corpus
+    # roughly doubled the disc count packed into the same footprint
+    # (AutoCheck: 69 -> 125) — at the old 60-unit gap the extra discs read
+    # as crowded rather than merely more numerous, since the greedy spiral
+    # packs each new disc into the FIRST clearing that fits, which trends
+    # tighter as disc count rises. Bumped rather than left to the uniform
+    # post-hoc scale-up (`_class_cluster_layout`'s target_extent step)
+    # because that scale multiplies positions AND radii together and so
+    # preserves this packing's relative density exactly — it changes how
+    # big the picture looks, not how crowded it is.
+    gap = 100.0
     for key, radius in sorted(sizes, key=lambda kv: -kv[1]):
         if not placed:
             out[key] = (0.0, 0.0)
@@ -1056,7 +1166,7 @@ def _pack_discs(sizes: list[tuple[str, float]]) -> dict[str, tuple[float, float]
 def _ring_positions(
     sizes: list[tuple[str, float]],
     inner_extent: float,
-    gap: float = 60.0,
+    gap: float = 100.0,
 ) -> dict[str, tuple[float, float]]:
     """Place each (key, radius) disc on ONE ring outside `inner_extent`.
 
@@ -1100,36 +1210,28 @@ def _ring_positions(
     return out
 
 
-def _class_cluster_layout(
-    G: nx.DiGraph,
-) -> "tuple[dict[str, dict[str, float]], dict[str, tuple[float, float, float]], dict[str, list[str]]]":
-    """Fixed (x, y) positions for EVERY class in the graph and its own
-    members, laid out so class regions never overlap each other.
-
-    The default force-directed physics positions a method by the CALL
-    graph, which routinely interleaves two different classes' methods in
-    the same screen region (a class's methods call all over the codebase,
-    not just each other), so a boundary drawn around a class over physics
-    positions collides with its neighbors by construction — no amount of
-    hull styling fixes that. This assigns each class its own disc instead
-    (see `_pack_discs`, which guarantees non-overlap), and scatters that
-    class's own node plus its members inside that disc
-    (`_stable_unit_pair`) — deliberately NOT on a regular ring: the members'
-    arrangement WITHIN a class carries no meaning worth encoding, and a
-    visible ring implies an ordering that doesn't exist.
+def _region_membership(G: nx.DiGraph) -> "tuple[dict[str, list[str]], dict[str, str]]":
+    """Which class/module/external REGION every node in `G` belongs to —
+    the partition `_class_cluster_layout` lays out in (x, y), and
+    `data_floor.compute_floors_with_provenance`'s `region_of` contracts
+    into one unit per region for floor purposes. Split out as its own
+    function because floor computation needs ONLY this partition, not the
+    O(n^2) disc-packing layout `_class_cluster_layout` builds on top of it
+    — running the packer just to read off membership would be wasted work
+    on every corpus this runs on.
 
     Covers every node with `_callable_class` set (graphify's own extractor
-    attribute — see extractors/engine.py), not just the god nodes a
-    decouple plan analyzed: a class boundary is a fact about the code, true
-    whether or not that particular class scored high enough to be a split
-    candidate. A class with no members is skipped — there is no region to
-    draw, and pinning a lone node would only fight the physics layout for
-    nothing.
+    attribute — see extractors/engine.py) as its own class region — a
+    class boundary is a fact about the code, true whether or not that
+    particular class scored high enough to be a split candidate. A class
+    with no members is skipped — member-less, there is nothing to group.
 
     Everything the class pass does not claim is placed too, because a
-    region is what makes a node's edges DRAWABLE: both views aggregate
-    links region-to-region and silently drop any edge with an end in no
-    region. An earlier version left out declaration-shaped nodes (file
+    region is what makes a node's edges DRAWABLE downstream — both views
+    aggregate links region-to-region and drop any edge with an end in no
+    region, and `data_floor`'s region-contraction similarly treats an
+    unregioned node as its own singleton unit rather than folding it into
+    anything. An earlier version left out declaration-shaped nodes (file
     hubs, method stubs, external symbols) on the reasoning that they
     declare something existing elsewhere rather than being code in this
     unit — true about the NODES, but it deleted their edges from the
@@ -1151,34 +1253,20 @@ def _class_cluster_layout(
     something this corpus never declares). Placement is now 100% of nodes
     and 100% of edges on that same corpus.
 
-    A region NOTHING else touches is placed on an outer ring
-    (`_ring_positions`) rather than packed in among the rest, so "unrelated
-    to anything" is visible before a label is read — on AutoCheck that is
-    19 regions, every one an asset file or an empty `__init__.py`. That
-    test only became trustworthy once every node had a region: while
-    externals were in none, a unit whose only neighbors were externals
-    looked untouched while having real calls.
-
-    Returns `(positions, discs, region_members)`. `discs` maps each region's
-    key (a class node id, or a `_module::<path>` / `_external::<name>`
-    synthetic key) to its
-    `(center_x, center_y, radius)`. The renderer draws THAT circle rather
-    than fitting an ellipse to the member positions: the disc is the exact
-    region `_pack_discs` proved non-overlapping, whereas a fitted ellipse
-    has to be padded outward to cover every member and can then cross into
-    a neighbor (measured on a real corpus: 7 overlapping pairs from fitting
-    alone, on a layout whose discs were provably disjoint). `region_members`
-    is the AUTHORITATIVE membership for each key — callers must use it
-    rather than re-deriving "who's in this module region" from source_file
-    (an earlier version of this code's caller did exactly that, filtering
-    `positions` by `source_file`, and silently pulled in a DIFFERENT class's
-    members whenever a class shared a file with free functions — every node
-    is claimed by exactly ONE region here, so this dict is the single
-    source of truth for it).
+    Returns `(members_by_class, region_of)`. `members_by_class` maps each
+    region's key (a class node id, or a `_module::<path>` /
+    `_external::<name>` synthetic key) to its sorted member list — for a
+    class region the class's OWN node is NOT included in the list (it is
+    the key), while a module/external region's list IS its full membership
+    (there is no separate node to be the key). `region_of` maps every node
+    that has a region (class or member) to that region's key — the
+    AUTHORITATIVE membership lookup; callers must use it rather than
+    re-deriving "who's in this module region" from `source_file` (an
+    earlier version of a caller did exactly that, and silently pulled in a
+    DIFFERENT class's members whenever a class shared a file with free
+    functions — every node is claimed by exactly ONE region here, so this
+    dict is the single source of truth for it).
     """
-    from graphify.analyze import _is_file_node
-
-    sizes: list[tuple[str, float]] = []
     members_by_class: dict[str, list[str]] = {}
     in_a_class: set[str] = set()
     for nid, data in G.nodes(data=True):
@@ -1190,38 +1278,7 @@ def _class_cluster_layout(
         members_by_class[nid] = members
         in_a_class.add(nid)
         in_a_class.update(members)
-        sizes.append((nid, _class_disc_radius(len(members))))
 
-    # EVERY remaining node is placed in some region. A region is what makes
-    # a node's edges drawable at all — both views aggregate links
-    # region-to-region and drop any edge whose end is in no region — so
-    # leaving a category out does not merely omit its discs, it silently
-    # deletes its wiring from the picture. Measured on a real corpus
-    # (AutoCheck, 1232 nodes): the old rules claimed 703 nodes, and of 2364
-    # edges only 1121 (47%) had both ends in a region. Three regions were
-    # drawn with no link at all despite having real outgoing calls —
-    # PointInfoBar calls QWidget and QHBoxLayout, which were nobody's
-    # members, so every one of its edges vanished. The excluded categories
-    # were, by recoverable edges: file hub nodes (+589), docstrings (+279),
-    # external symbols (+171), then non-callable code, concepts and docs.
-    # This is worse the more languages a corpus mixes, since each language's
-    # externals and declaration nodes add to the same excluded pile.
-    #
-    # Where each goes:
-    #   - a node with a `source_file` joins that file's module region —
-    #     including the synthetic file hub node, whose `contains` edges then
-    #     become INTERNAL to the region (not drawn, correctly: a file
-    #     listing its own symbols is not a relationship between two units)
-    #     while its `imports` edges become real region-to-region links;
-    #   - a docstring/rationale node joins the region of the symbol it
-    #     documents (`rationale_for`), which is a stronger statement of
-    #     where it belongs than its file is, and falls back to its file;
-    #   - an external symbol (no `source_file`: `QWidget`, `ndarray`,
-    #     `parametrize`) has no file to join, so same-named externals form
-    #     one region of their own. Keyed by NAME, which is the only
-    #     language-neutral identity available here — there is no import
-    #     graph back to a package for a symbol that was never declared in
-    #     this corpus.
     region_of: dict[str, str] = {}
     for cid, ms in members_by_class.items():
         for n in [cid, *ms]:
@@ -1267,24 +1324,59 @@ def _class_cluster_layout(
         # lone function is not a unit worth outlining"), but the cost of
         # that tidiness is the node's entire wiring, which is not a
         # trade worth making for one fewer small circle.
-        key = f"_module::{source_file}"
-        members_by_class[key] = sorted(file_nodes)
-        sizes.append((key, _class_disc_radius(len(file_nodes))))
+        members_by_class[f"_module::{source_file}"] = sorted(file_nodes)
     for name, ext_nodes in by_external.items():
-        key = f"_external::{name}"
-        members_by_class[key] = sorted(ext_nodes)
-        sizes.append((key, _class_disc_radius(len(ext_nodes))))
+        members_by_class[f"_external::{name}"] = sorted(ext_nodes)
     for cid in members_by_class:
         members_by_class[cid] = sorted(members_by_class[cid])
+
+    return members_by_class, region_of
+
+
+def _class_cluster_layout(
+    G: nx.DiGraph,
+) -> "tuple[dict[str, dict[str, float]], dict[str, tuple[float, float, float]], dict[str, list[str]]]":
+    """Fixed (x, y) positions for EVERY class/module/external region in the
+    graph (see `_region_membership` for how membership is decided), laid
+    out so regions never overlap each other.
+
+    The default force-directed physics positions a method by the CALL
+    graph, which routinely interleaves two different classes' methods in
+    the same screen region (a class's methods call all over the codebase,
+    not just each other), so a boundary drawn around a class over physics
+    positions collides with its neighbors by construction — no amount of
+    hull styling fixes that. This assigns each region its own disc instead
+    (see `_pack_discs`, which guarantees non-overlap), and scatters that
+    region's own node (if it has one) plus its members inside that disc
+    (`_stable_unit_pair`) — deliberately NOT on a regular ring: the members'
+    arrangement WITHIN a region carries no meaning worth encoding, and a
+    visible ring implies an ordering that doesn't exist.
+
+    A region NOTHING else touches is placed on an outer ring
+    (`_ring_positions`) rather than packed in among the rest, so "unrelated
+    to anything" is visible before a label is read — on AutoCheck that is
+    19 regions, every one an asset file or an empty `__init__.py`. That
+    test only became trustworthy once every node had a region: while
+    externals were in none, a unit whose only neighbors were externals
+    looked untouched while having real calls.
+
+    Returns `(positions, discs, region_members)`. `discs` maps each region's
+    key to its `(center_x, center_y, radius)`. The renderer draws THAT
+    circle rather than fitting an ellipse to the member positions: the
+    disc is the exact region `_pack_discs` proved non-overlapping, whereas
+    a fitted ellipse has to be padded outward to cover every member and
+    can then cross into a neighbor (measured on a real corpus: 7
+    overlapping pairs from fitting alone, on a layout whose discs were
+    provably disjoint). `region_members` is `_region_membership`'s own
+    `members_by_class` — the AUTHORITATIVE membership for each key.
+    """
+    members_by_class, region_of = _region_membership(G)
+    sizes = [(cid, _class_disc_radius(len(ms))) for cid, ms in members_by_class.items()]
 
     if not sizes:
         return {}, {}, {}
 
     import math
-
-    # Recomputed after the placement above: a class region can have gained
-    # the docstrings of its own methods, and its disc has to cover them.
-    sizes = [(cid, _class_disc_radius(len(members_by_class[cid]))) for cid, _r in sizes]
 
     # A region NOTHING else in the corpus touches goes on an outer ring
     # (see _ring_positions) instead of being packed in among the rest.
@@ -1943,7 +2035,7 @@ def render_markdown(plan: dict[str, Any]) -> str:
                 else:
                     lines.append(f"  - state-sharing check: {sd.get('state_analysis', 'skipped')}")
                 if sd.get("group_floor_analysis") == "ok":
-                    lines.append(f"  - worst proposed group's own cross-floor risk: {sd['max_group_floor_risk']}")
+                    lines.append(f"  - proposed groups' cross-floor spread risk: {sd['max_group_floor_risk']}")
                 else:
                     lines.append(f"  - cross-floor check on proposed groups: {sd.get('group_floor_analysis', 'skipped')}")
             for g in entry.get("proposed_groups", []):
