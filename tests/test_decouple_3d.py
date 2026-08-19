@@ -69,11 +69,12 @@ def _floors_for(g):
 
 def test_floor_rank_compacts_gaps_between_occupied_floors(tmp_path):
     """Floors 2, 3, and 4 exist in the raw graph (a real chain runs through
-    them) but resolve to no region and no rendered member — same as
-    AutoCheck's rationale/test nodes, which have a floor but are never part
-    of any class/module region. Those unoccupied floors must not stretch
-    the Z axis: `floors`/`floor_rank` should list and rank only 0, 1, 5 —
-    dense, with no reserved slot for the empty ones in between."""
+    them) but resolve to no region and no rendered member: these are
+    docstring nodes that document nothing and belong to no file, the one
+    category `_class_cluster_layout` still cannot place. Those unoccupied
+    floors must not stretch the Z axis: `floors`/`floor_rank` should list
+    and rank only 0, 1, 5 — dense, with no reserved slot for the empty
+    ones in between."""
     g = nx.DiGraph()
     _code(g, "loader", "Loader", "app/io/loader.py", _callable_class=True)  # floor 0, a boundary
     _code(g, "loader_m", ".load()", "app/io/loader.py")
@@ -84,12 +85,13 @@ def test_floor_rank_compacts_gaps_between_occupied_floors(tmp_path):
     g.add_edge("near", "near_m", relation="method", confidence="EXTRACTED")
     g.add_edge("near_m", "loader_m", relation="calls", confidence="EXTRACTED")  # floor 1
 
-    # A real chain through nodes that never resolve into any region (they
-    # are "rationale", not code) — floors 2, 3, 4 are genuine but nothing
-    # ever gets drawn there.
-    g.add_node("r2", label="r2", file_type="rationale", source_file="docs/r2.md")
-    g.add_node("r3", label="r3", file_type="rationale", source_file="docs/r3.md")
-    g.add_node("r4", label="r4", file_type="rationale", source_file="docs/r4.md")
+    # A real chain through nodes that never resolve into any region: a
+    # docstring with no `rationale_for` subject AND no source_file has
+    # neither of the two things that would place it. Floors 2, 3, 4 are
+    # genuine but nothing ever gets drawn there.
+    g.add_node("r2", label="r2", file_type="rationale")
+    g.add_node("r3", label="r3", file_type="rationale")
+    g.add_node("r4", label="r4", file_type="rationale")
     g.add_edge("r2", "near_m", relation="calls")
     g.add_edge("r3", "r2", relation="calls")
     g.add_edge("r4", "r3", relation="calls")

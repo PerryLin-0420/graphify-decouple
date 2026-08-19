@@ -128,6 +128,10 @@ def build_floor_scene(
             dominant = min_floor = max_floor = spans = None
         if region_id.startswith("_module::"):
             label = region_id[len("_module::"):].rsplit("/", 1)[-1]
+        elif region_id.startswith("_external::"):
+            # A symbol this corpus calls but never declares (QWidget,
+            # ndarray) - it has no node of its own in the graph.
+            label = region_id[len("_external::"):]
         else:
             label = str(G.nodes[region_id].get("label", region_id))
         member_points = []
@@ -163,6 +167,16 @@ def build_floor_scene(
             node_region[m] = region_id
     region_ids = {r["id"] for r in regions}
     links = _aggregate_region_links(G, node_region, region_ids)
+
+    # A region no link touches. `_class_cluster_layout` has already placed
+    # these on an outer ring, so the flag is for the info panel to be able
+    # to SAY it rather than leave the reader to infer it from position.
+    # Trustworthy only because every node now belongs to some region: a
+    # unit whose only neighbors were external symbols or file hubs used to
+    # land here while having real calls.
+    touched = {l["source"] for l in links} | {l["target"] for l in links}
+    for r in regions:
+        r["isolated"] = r["id"] not in touched
 
     # Every RAW floor number that has something to actually draw there — a
     # region's own dominant floor, OR any individual member scattered off
@@ -342,7 +356,7 @@ SCENE.regions.forEach(r => {{
     new THREE.MeshBasicMaterial({{ color, transparent: true, opacity: isProposed ? 0.28 : 0.20, side: THREE.DoubleSide }})
   );
   disc.position.set(r.x, r.y, floorZ(r.floor));
-  disc.userData = {{ label: r.label, kind: 'region', spans: r.spans, floor: r.floor, n: r.member_count, regionId: r.id }};
+  disc.userData = {{ label: r.label, kind: 'region', spans: r.spans, floor: r.floor, n: r.member_count, regionId: r.id, isolated: r.isolated }};
   addToFloor(r.floor, disc);
 
   // A dashed ring for a proposed group — same "not real yet" signal the 2D
@@ -628,7 +642,8 @@ renderer.domElement.addEventListener('mousemove', e => {{
     tip.style.top = (e.clientY - rect.top + 10) + 'px';
     const floorText = d.floor === null ? 'unknown (not linked to any measured unit)' : d.floor;
     tip.textContent = d.label + ' — floor ' + floorText + ', ' + d.n + ' members'
-      + (d.spans ? ' (spans ' + (d.spans + 1) + ' floors)' : '');
+      + (d.spans ? ' (spans ' + (d.spans + 1) + ' floors)' : '')
+      + (d.isolated ? ' — nothing in the corpus links to it (drawn on the outer ring)' : '');
   }} else {{
     tip.style.display = 'none';
   }}

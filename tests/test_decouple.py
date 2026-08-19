@@ -594,7 +594,13 @@ def test_build_augmented_graph_hulls_cover_every_class_not_just_god_nodes():
     g2, _ = build_augmented_graph(g, plan, communities)
     labels = {h["label"] for h in g2.graph["hyperedges"]}
     # every class WITH members, regardless of what the plan looked at
-    assert labels == {"GodClass", "BigClass", "TangledClass", "PipelineClass"}
+    assert {"GodClass", "BigClass", "TangledClass", "PipelineClass"} <= labels
+    # everything else outlined is a per-FILE region: since every node now
+    # belongs to some region (a node in none has its edges dropped from
+    # both views), a file whose nodes no class claimed gets its own.
+    assert all(lbl.endswith(".py") for lbl in labels - {
+        "GodClass", "BigClass", "TangledClass", "PipelineClass"
+    })
     assert "HubClass" not in labels  # no members -> no region to draw
 
 

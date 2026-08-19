@@ -1004,6 +1004,13 @@ def _class_disc_radius(member_count: int) -> float:
     return 70.0 + 42.0 * math.sqrt(max(member_count, 1))
 
 
+def _neighbors_any_direction(G: nx.Graph, n: str) -> set:
+    """Every node adjacent to `n`, regardless of edge direction."""
+    if G.is_directed():
+        return set(G.predecessors(n)) | set(G.successors(n))
+    return set(G.neighbors(n))
+
+
 def _pack_discs(sizes: list[tuple[str, float]]) -> dict[str, tuple[float, float]]:
     """Place each (key, radius) disc so NO two overlap, largest first, by
     walking an Archimedean spiral outward from the origin and taking the
@@ -1046,6 +1053,53 @@ def _pack_discs(sizes: list[tuple[str, float]]) -> dict[str, tuple[float, float]
     return out
 
 
+def _ring_positions(
+    sizes: list[tuple[str, float]],
+    inner_extent: float,
+    gap: float = 60.0,
+) -> dict[str, tuple[float, float]]:
+    """Place each (key, radius) disc on ONE ring outside `inner_extent`.
+
+    For regions nothing else in the corpus touches. Packed in among the
+    connected ones they read as part of the structure — an asset file or an
+    empty `__init__.py` sitting between two classes looks like it belongs
+    to that neighborhood, when the truth is it has no relationship to
+    anything. On a ring outside everything else, "unrelated" is the first
+    thing the layout says about them, before any label is read.
+
+    The ring's radius is whichever is larger: far enough to clear the
+    packed layout, or long enough that every disc's share of the
+    CIRCUMFERENCE covers its own diameter plus `gap`. The second condition
+    is what keeps the ring from overlapping itself once there are many
+    discs on it — a corpus with 40 asset files needs a bigger circle than
+    one with 3, and sizing by count rather than by extent is the only way
+    to get that without another packing pass.
+    """
+    import math
+
+    if not sizes:
+        return {}
+    ordered = sorted(sizes, key=lambda kv: (-kv[1], kv[0]))
+    widest = max(r for _k, r in ordered)
+    needed_circumference = sum(2 * r + gap for _k, r in ordered)
+    radius = max(
+        inner_extent + gap + widest,
+        needed_circumference / (2 * math.pi),
+    )
+    out: dict[str, tuple[float, float]] = {}
+    angle = 0.0
+    for key, r in ordered:
+        # Arc length this disc needs, as an angle. A chord is shorter than
+        # its arc, so the real center-to-center distance is slightly under
+        # the arc — the margin absorbs that rather than solving for the
+        # chord exactly.
+        span = 1.15 * (2 * r + gap) / radius
+        angle += span / 2
+        out[key] = (radius * math.cos(angle), radius * math.sin(angle))
+        angle += span / 2
+    return out
+
+
 def _class_cluster_layout(
     G: nx.DiGraph,
 ) -> "tuple[dict[str, dict[str, float]], dict[str, tuple[float, float, float]], dict[str, list[str]]]":
@@ -1072,20 +1126,42 @@ def _class_cluster_layout(
     draw, and pinning a lone node would only fight the physics layout for
     nothing.
 
-    Free functions — real callables that belong to no class — are grouped
-    by their own SOURCE FILE into module regions, so every implementation
-    node ends up inside some boundary rather than floating unattached
-    (measured on a real corpus: 368 callable nodes, most of a procedural
-    module's content, sat outside every class region). A module region is
-    the same kind of statement a class region is: "this is one unit".
-    Nodes that are pure DECLARATION rather than implementation are
-    deliberately left out — the synthetic file-level hub node graphify's
-    extractor creates per file, method stubs, and external symbols with no
-    source file of their own (`numpy.ndarray` and friends): they declare
-    that something exists elsewhere, they are not code living in this unit.
+    Everything the class pass does not claim is placed too, because a
+    region is what makes a node's edges DRAWABLE: both views aggregate
+    links region-to-region and silently drop any edge with an end in no
+    region. An earlier version left out declaration-shaped nodes (file
+    hubs, method stubs, external symbols) on the reasoning that they
+    declare something existing elsewhere rather than being code in this
+    unit — true about the NODES, but it deleted their edges from the
+    picture along with them. Measured on a real corpus (AutoCheck, 1232
+    nodes): 703 nodes were claimed, and of 2364 edges only 1121 (47%) had
+    both ends in a region; `PointInfoBar` was drawn with no link at all
+    while genuinely calling `QWidget` and `QHBoxLayout`, because those were
+    nobody's members. A corpus mixing several languages makes this worse,
+    since each language contributes its own externals and declaration
+    nodes to the same excluded pile.
+
+    So: a node with a `source_file` joins that file's module region
+    (including the file hub, whose `contains` edges then become internal
+    — correctly, a file listing its own symbols is not a relationship
+    between two units — while its `imports` edges become real links); a
+    docstring joins the region of the symbol it documents; and an external
+    symbol, having no file to join, shares a region with every same-named
+    external (its NAME is the only language-neutral identity available for
+    something this corpus never declares). Placement is now 100% of nodes
+    and 100% of edges on that same corpus.
+
+    A region NOTHING else touches is placed on an outer ring
+    (`_ring_positions`) rather than packed in among the rest, so "unrelated
+    to anything" is visible before a label is read — on AutoCheck that is
+    19 regions, every one an asset file or an empty `__init__.py`. That
+    test only became trustworthy once every node had a region: while
+    externals were in none, a unit whose only neighbors were externals
+    looked untouched while having real calls.
 
     Returns `(positions, discs, region_members)`. `discs` maps each region's
-    key (a class node id, or a `_module::<path>` synthetic key) to its
+    key (a class node id, or a `_module::<path>` / `_external::<name>`
+    synthetic key) to its
     `(center_x, center_y, radius)`. The renderer draws THAT circle rather
     than fitting an ellipse to the member positions: the disc is the exact
     region `_pack_discs` proved non-overlapping, whereas a fitted ellipse
@@ -1116,42 +1192,135 @@ def _class_cluster_layout(
         in_a_class.update(members)
         sizes.append((nid, _class_disc_radius(len(members))))
 
-    # Module regions for the free functions left over.
-    free_by_file: dict[str, list[str]] = {}
+    # EVERY remaining node is placed in some region. A region is what makes
+    # a node's edges drawable at all — both views aggregate links
+    # region-to-region and drop any edge whose end is in no region — so
+    # leaving a category out does not merely omit its discs, it silently
+    # deletes its wiring from the picture. Measured on a real corpus
+    # (AutoCheck, 1232 nodes): the old rules claimed 703 nodes, and of 2364
+    # edges only 1121 (47%) had both ends in a region. Three regions were
+    # drawn with no link at all despite having real outgoing calls —
+    # PointInfoBar calls QWidget and QHBoxLayout, which were nobody's
+    # members, so every one of its edges vanished. The excluded categories
+    # were, by recoverable edges: file hub nodes (+589), docstrings (+279),
+    # external symbols (+171), then non-callable code, concepts and docs.
+    # This is worse the more languages a corpus mixes, since each language's
+    # externals and declaration nodes add to the same excluded pile.
+    #
+    # Where each goes:
+    #   - a node with a `source_file` joins that file's module region —
+    #     including the synthetic file hub node, whose `contains` edges then
+    #     become INTERNAL to the region (not drawn, correctly: a file
+    #     listing its own symbols is not a relationship between two units)
+    #     while its `imports` edges become real region-to-region links;
+    #   - a docstring/rationale node joins the region of the symbol it
+    #     documents (`rationale_for`), which is a stronger statement of
+    #     where it belongs than its file is, and falls back to its file;
+    #   - an external symbol (no `source_file`: `QWidget`, `ndarray`,
+    #     `parametrize`) has no file to join, so same-named externals form
+    #     one region of their own. Keyed by NAME, which is the only
+    #     language-neutral identity available here — there is no import
+    #     graph back to a package for a symbol that was never declared in
+    #     this corpus.
+    region_of: dict[str, str] = {}
+    for cid, ms in members_by_class.items():
+        for n in [cid, *ms]:
+            region_of[n] = cid
+    by_file: dict[str, list[str]] = {}
+    by_external: dict[str, list[str]] = {}
+    rationale_nodes: list[str] = []
     for nid, data in G.nodes(data=True):
         if nid in in_a_class:
             continue
-        if data.get("file_type") != "code" or not data.get("_callable"):
+        if data.get("file_type") == "rationale":
+            rationale_nodes.append(nid)  # placed below, once regions are known
             continue
-        if data.get("_callable_class"):
-            continue  # a memberless class: no region, see above
         source_file = str(data.get("source_file") or "")
-        if not source_file:
-            continue  # external symbol — declared elsewhere, not code here
-        if _is_file_node(G, nid):
-            continue  # synthetic file hub / stub — declaration, not implementation
-        free_by_file.setdefault(source_file, []).append(nid)
-    for source_file, free_nodes in free_by_file.items():
-        if len(free_nodes) < 2:
-            continue  # a lone function is not a "unit" worth outlining
+        if source_file:
+            by_file.setdefault(source_file, []).append(nid)
+            region_of[nid] = f"_module::{source_file}"
+        else:
+            name = str(data.get("label") or nid)
+            by_external.setdefault(name, []).append(nid)
+            region_of[nid] = f"_external::{name}"
+    for nid in sorted(rationale_nodes):
+        subject_region = None
+        for _u, v, edata in sorted(G.out_edges(nid, data=True), key=lambda e: e[1]):
+            if edata.get("relation") == "rationale_for" and v in region_of:
+                subject_region = region_of[v]
+                break
+        if subject_region is None:
+            source_file = str(G.nodes[nid].get("source_file") or "")
+            subject_region = f"_module::{source_file}" if source_file else None
+        if subject_region is None:
+            continue  # a docstring documenting nothing, in no file
+        region_of[nid] = subject_region
+        if subject_region.startswith("_module::"):
+            by_file.setdefault(subject_region[len("_module::"):], []).append(nid)
+        elif subject_region.startswith("_external::"):
+            by_external.setdefault(subject_region[len("_external::"):], []).append(nid)
+        else:
+            members_by_class[subject_region].append(nid)
+
+    for source_file, file_nodes in by_file.items():
+        # A single-node region is still drawn. It was skipped before ("a
+        # lone function is not a unit worth outlining"), but the cost of
+        # that tidiness is the node's entire wiring, which is not a
+        # trade worth making for one fewer small circle.
         key = f"_module::{source_file}"
-        members_by_class[key] = sorted(free_nodes)
-        sizes.append((key, _class_disc_radius(len(free_nodes))))
+        members_by_class[key] = sorted(file_nodes)
+        sizes.append((key, _class_disc_radius(len(file_nodes))))
+    for name, ext_nodes in by_external.items():
+        key = f"_external::{name}"
+        members_by_class[key] = sorted(ext_nodes)
+        sizes.append((key, _class_disc_radius(len(ext_nodes))))
+    for cid in members_by_class:
+        members_by_class[cid] = sorted(members_by_class[cid])
 
     if not sizes:
         return {}, {}, {}
 
     import math
 
-    anchors = _pack_discs(sizes)
+    # Recomputed after the placement above: a class region can have gained
+    # the docstrings of its own methods, and its disc has to cover them.
+    sizes = [(cid, _class_disc_radius(len(members_by_class[cid]))) for cid, _r in sizes]
+
+    # A region NOTHING else in the corpus touches goes on an outer ring
+    # (see _ring_positions) instead of being packed in among the rest.
+    # This test is only trustworthy now that every node belongs to some
+    # region: while external symbols and file hubs were in none, a unit
+    # whose only neighbors were those looked untouched while having real
+    # calls (PointInfoBar calls QWidget, and read as isolated because
+    # QWidget was nobody's member). Now "no link" means no relationship.
+    connected: set[str] = set()
+    for cid, ms in members_by_class.items():
+        for n in [cid, *ms]:
+            if n not in G.nodes:
+                continue
+            for nb in _neighbors_any_direction(G, n):
+                other = region_of.get(nb)
+                if other is not None and other != cid:
+                    connected.add(cid)
+                    break
+            if cid in connected:
+                break
+    inner_sizes = [(k, r) for k, r in sizes if k in connected]
+    outer_sizes = [(k, r) for k, r in sizes if k not in connected]
+    anchors = _pack_discs(inner_sizes)
+    inner_extent = max(
+        (math.hypot(x, y) + dict(inner_sizes)[k] for k, (x, y) in anchors.items()),
+        default=0.0,
+    )
+    anchors.update(_ring_positions(outer_sizes, inner_extent))
     positions: dict[str, dict[str, float]] = {}
     discs: dict[str, tuple[float, float, float]] = {}
     for class_id, members in members_by_class.items():
         ax, ay = anchors[class_id]
         radius = _class_disc_radius(len(members))
-        # A module region has no node of its own to pin (its key is
-        # synthetic) — only its members get positions.
-        if not class_id.startswith("_module::"):
+        # A module or external region has no node of its own to pin (its
+        # key is synthetic) — only its members get positions.
+        if class_id in G.nodes:
             positions[class_id] = {"x": ax, "y": ay}
         discs[class_id] = (ax, ay, radius)
         for m in members:
@@ -1541,21 +1710,24 @@ def build_augmented_graph(
     for i, region_id in enumerate(sorted(class_discs)):
         cx, cy, radius = class_discs[region_id]
         color = COMMUNITY_COLORS[i % len(COMMUNITY_COLORS)]
+        # Membership always comes from region_members (the layout's own
+        # authoritative list), NOT re-derived by filtering on source_file —
+        # a class defined in the SAME file as free functions would
+        # otherwise get pulled into that file's region too, even though its
+        # members already belong to (and are correctly positioned by) their
+        # own class's region.
+        region_nodes = list(region_members.get(region_id, []))
         if region_id.startswith("_module::"):
-            # A module region groups the free functions of one file — same
-            # kind of "this is one unit" statement as a class region, drawn
-            # identically, labeled by the file it came from. Membership
-            # comes from region_members (the layout's own authoritative
-            # list), NOT re-derived by filtering on source_file — a class
-            # defined in the SAME file as free functions would otherwise
-            # get pulled into this region too, even though its members
-            # already belong to (and are correctly positioned by) their
-            # own class's region.
-            source_file = region_id[len("_module::"):]
-            region_nodes = list(region_members.get(region_id, []))
-            label = source_file.rsplit("/", 1)[-1]
+            # One file's own nodes — same "this is one unit" statement as a
+            # class region, drawn identically, labeled by the file.
+            label = region_id[len("_module::"):].rsplit("/", 1)[-1]
+        elif region_id.startswith("_external::"):
+            # A symbol this corpus calls but never declares (QWidget,
+            # ndarray). It is one unit as far as this corpus can tell, and
+            # drawing it is what keeps its callers' edges visible.
+            label = region_id[len("_external::"):]
         else:
-            region_nodes = [region_id] + list(member_ids(G, region_id))
+            region_nodes = [region_id] + region_nodes
             label = G.nodes[region_id].get("label", region_id)
         hulls.append({
             "nodes": region_nodes,
