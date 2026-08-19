@@ -103,13 +103,6 @@ Every edge carries a **confidence tag** (`EXTRACTED` = explicit in the source, `
   <em>DECOUPLE.html on a real run — clicking a proposed class shows exactly which other class it shares state with, and what specifically is shared.</em>
 </p>
 
-The same page also renders the split itself. Toggling **Preview decoupled view** swaps the god class's own methods for the proposed classes and re-routes the edges in place — the wiring change, not a redrawn diagram:
-
-| Before — the god class today | After — Preview decoupled view |
-| --- | --- |
-| <img src="docs/decouple-before.png" alt="DECOUPLE.html before the toggle: a single MainWindow hub node with its own methods fanned out around it" width="440"> | <img src="docs/decouple-after.png" alt="DECOUPLE.html after the toggle: the same node reduced to 5 diamond-shaped proposed classes, green dashed edges showing which methods were extracted into each, red edges showing shared instance state between two of them" width="440"> |
-| One node holding 47 of its own methods, every one of them reachable only through the class. | The proposed classes. Green dashed = what got extracted into each; red = the instance state two of them still share, which is exactly what decides `split` vs `keep_as_is`. Only candidates that clear the risk threshold are drawn — here 5 of 6, which is why one method has no diamond to land on. |
-
 `graphify decouple` finds god objects and tells you whether splitting them is actually worth it — not just that they're big.
 
 The failure mode this exists to catch: a class with 47 methods that call-graph clustering happily splits into 5 tidy-looking groups, all of which still read and write the exact same `self._chart_style` / `self._crosshair` instance state underneath. Ship that split and you haven't decoupled anything — you've moved methods into new files that still can't be tested, changed, or reasoned about independently, because they all still need the same shared state passed back in. A tool that only looks at the call graph cannot see this at all; it has to go back to the actual source.
@@ -127,18 +120,21 @@ graphify decouple --no-state-check             # call-graph-only scoring (skips 
 graphify decouple --json                       # print decouple.json to stdout
 ```
 
-Outputs three files next to `graph.json`:
+Outputs three files next to `graph.json` (four with `--3d`):
 
 ```
 graphify-out/
 ├── DECOUPLE_PLAN.md   # human-readable: per god node, classification, risk_before -> risk_after,
 │                      # which methods move where, and exactly which attributes/writes/calls are shared
 ├── decouple.json      # the same plan as structured data — feed it to any AI or script
-└── DECOUPLE.html      # the SAME force-directed graph.html renderer, not a separate diagram:
-                       # a "Preview decoupled view" toggle swaps the real methods for the proposed
-                       # classes and re-routes their edges live, so you see the wiring change, not
-                       # just a before/after screenshot; click any proposed class to see exactly
-                       # which other class it shares state with and what specifically is shared
+├── DECOUPLE.html      # the SAME force-directed graph.html renderer, not a separate diagram:
+│                      # a "Preview decoupled view" toggle swaps the real methods for the proposed
+│                      # classes and re-routes their edges live, so you see the wiring change, not
+│                      # just a before/after screenshot; click any proposed class to see exactly
+│                      # which other class it shares state with and what specifically is shared
+└── DECOUPLE_3D.html   # --3d only: the SAME regions, at the SAME (x, y), stacked on Z by data-flow
+                       # floor (graphify.data_floor) — the axis DECOUPLE.html's 2D layout can't show;
+                       # see "From 2D to 3D: floors as a weighted risk axis" below
 ```
 
 **Language coverage for the state-sharing check** (the call-graph-only classification above works for every language graphify extracts; this table is specifically the source re-parse that verifies `self`/`this` state overlap):
@@ -159,6 +155,37 @@ graphify-out/
 | C | ❌ | a struct-pointer parameter has no syntactic marker distinguishing it from any other parameter — no reliable signal without full type inference |
 
 A god node in an unsupported language, or one whose source can't be read, is marked `state_analysis: "skipped"` — the classification and call-graph score still run, but the recommendation rests on the call graph alone rather than silently assuming the state check passed.
+
+### From 2D to 3D: floors as a weighted risk axis
+
+`DECOUPLE.html` answers *what belongs to what* — class and module regions, packed non-overlapping over graphify's own force-directed renderer. It cannot show the other structural axis: **how far each unit sits from the system's I/O boundary.** A class that reads a file, a class that computes on what was read, and a class that renders the result are three different jobs — one class doing all three is a problem the call-graph metrics above can't see, because member_ratio and cross-group edges are blind to *which stage of the pipeline* a method belongs to.
+
+`graphify decouple --3d` renders that axis directly, as a stack of floor planes:
+
+<p align="center">
+  <img src="docs/decouple-3d-demo.svg" alt="graphify decouple --3d: data_floor computes the longest weighted path from the I/O boundary, a god class replaced by two proposed groups landing on floor 2 and floor 4" width="900">
+</p>
+
+```bash
+graphify decouple --3d               # + DECOUPLE_3D.html alongside the others
+graphify decouple --3d --project-root .
+```
+
+**Floor 0 is the I/O boundary** (parsers, loaders, readers, writers, DB/HTTP clients — detected by the same name heuristic as everywhere else in graphify, `boundary_reason` audits every call). Floor *N* is the **longest** weighted directed path from any boundary node to that unit — not the shortest, because a node reachable both by a one-hop shortcut and a 4-stage chain is genuinely downstream of that whole chain. Hops are weighted, not counted flat: a call **between** modules costs one floor; a `method` containment edge and an intra-module call cost **zero**, because they describe one unit's own internal composition, not a pipeline stage. And critically, floors are computed at **class/module granularity, not per function** — every method of one class shares its class's floor by construction, because a function is contained by its class the same way a `method` edge already says. Without that, a class with 34 methods — most shallow, a couple reaching three classes deeper through a rarely-used callback — let its own identity inherit that outlier's depth, while its 3D region displayed a *different*, shallower number (the majority vote over its members) — two numbers for one unit, matching neither its real behavior nor what was actually drawn.
+
+<p align="center">
+  <img src="docs/decouple-3d-screenshot.png" alt="DECOUPLE_3D.html on a real run: class/module regions stacked on floor planes 0 through 5, blue lines for same-floor links, red lines slanting between floors for cross-floor dependencies" width="900">
+</p>
+<p align="center">
+  <em>DECOUPLE_3D.html on a real run — every region sits at the exact (x, y) the 2D view placed it at; only the floor (Z) is new. A drag-adjustable "region spacing" slider re-packs the (x, y) layout live for corpora too dense to read at the default gap.</em>
+</p>
+
+That class/module-granularity floor feeds straight back into the risk score: `cross_floor_risk` is now a question about **proposed split groups**, not about an unsplit class's own members (which, being one unit by construction, can no longer disagree). `data_floor.hypothetical_group_floor` estimates where each proposed group would land if actually extracted — from its own edges to whatever is genuinely outside the class — and `split_risk_score`'s `max_group_floor_risk` scores whether those groups would end up on *different* floors from each other:
+
+| Before — one region, one floor | After — Preview decoupled view |
+| --- | --- |
+| <img src="docs/decouple-3d-before.png" alt="DECOUPLE_3D.html before the toggle: one solid disc for the god class, sitting at its own single measured floor" width="440"> | <img src="docs/decouple-3d-after.png" alt="DECOUPLE_3D.html after the toggle: the same disc replaced by several smaller dashed-ring proposed-group discs, scattered across neighboring floors" width="440"> |
+| One class, one shared floor — every method's own position collapses to the same number, because a function is contained by its class. | The proposed groups, each on its OWN hypothetical floor. A split that scatters its groups across floors is flagged with a real, non-zero `max_group_floor_risk` — a risk the call graph alone cannot see, and now something you can see too. |
 
 ---
 
@@ -860,6 +887,7 @@ graphify decouple --extracted-only                    # ignore INFERRED/AMBIGUOU
 graphify decouple --no-state-check                    # skip the source re-parse, call-graph-only scoring
 graphify decouple --output-dir docs/decouple           # write DECOUPLE_PLAN.md/decouple.json/DECOUPLE.html elsewhere
 graphify decouple --no-html                           # skip DECOUPLE.html generation
+graphify decouple --3d                                # + DECOUPLE_3D.html — data-flow floors stacked on Z
 graphify decouple --json                              # print decouple.json to stdout instead of writing files
 ```
 
