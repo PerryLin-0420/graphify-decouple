@@ -141,7 +141,13 @@ def test_build_floor_scene_reuses_2d_member_positions_exactly():
         assert matches, f"no 2D position matches member point {m}"
 
 
-def test_build_floor_scene_omits_region_with_no_known_floor():
+def test_build_floor_scene_renders_unknown_floor_region_on_a_dedicated_band():
+    """A region with no determinable floor is NOT dropped — it is rendered
+    with floor=None, its own "unknown" band distinct from the numbered
+    stack. Dropping it outright (the earlier behavior) silently erased
+    every real link to or from it too, not just its own disc — measured on
+    a real corpus: a test file with 37 genuine cross-file calls looked
+    completely disconnected because its only targets had no known floor."""
     g = nx.DiGraph()
     _code(g, "island", "Island", "app/isolated.py", _callable_class=True)
     for i in range(3):
@@ -149,7 +155,45 @@ def test_build_floor_scene_omits_region_with_no_known_floor():
         g.add_edge("island", f"im{i}", relation="method", confidence="EXTRACTED")
     _positions, discs, region_members = _class_cluster_layout(g)
     payload = build_floor_scene(g, discs, _positions, region_members, {}, COMMUNITY_COLORS)
-    assert payload["regions"] == []
+    assert len(payload["regions"]) == 1
+    region = payload["regions"][0]
+    assert region["floor"] is None
+    assert region["min_floor"] is None and region["max_floor"] is None and region["spans"] is None
+    # None must never leak into the NUMBERED floor list — it has its own band
+    assert None not in payload["floors"]
+
+
+def test_a_units_real_links_survive_when_its_only_neighbor_has_no_floor():
+    """The actual bug this guards: Known (floor 0, real boundary) connects
+    to Unknown (no boundary reachable at all — an island, and NOT rescuable
+    either, since a `references` edge is not call-shaped and so carries no
+    floor evidence). Since Unknown used to be dropped outright, Known's
+    one real, genuine connection to it vanished from the link set too,
+    making a perfectly normal caller look completely disconnected in the
+    3D view for a reason having nothing to do with its own connectivity."""
+    g = nx.DiGraph()
+    _code(g, "boundary", "load_config()", source_file="app/io/thing.py")
+    _code(g, "known", "Known", source_file="app/known.py", _callable_class=True)
+    _code(g, "known_m", ".go()", source_file="app/known.py")
+    g.add_edge("known", "known_m", relation="method", confidence="EXTRACTED")
+    g.add_edge("known_m", "boundary", relation="calls", confidence="EXTRACTED")
+
+    _code(g, "unknown", "Unknown", source_file="app/isolated.py", _callable_class=True)
+    for i in range(3):
+        _code(g, f"um{i}", f".m{i}()", source_file="app/isolated.py")
+        g.add_edge("unknown", f"um{i}", relation="method", confidence="EXTRACTED")
+    # A real structural edge, but not call-shaped — carries no floor
+    # evidence (for either the main pass or the rescue pass), yet must
+    # still show up as a real link in the 3D view, same as any other edge.
+    g.add_edge("known_m", "um0", relation="references", confidence="EXTRACTED")
+
+    floors = _floors_for(g)
+    positions, discs, region_members = _class_cluster_layout(g)
+    payload = build_floor_scene(g, discs, positions, region_members, floors, COMMUNITY_COLORS)
+    by_label = {r["label"]: r for r in payload["regions"]}
+    assert by_label["Unknown"]["floor"] is None
+    pairs = {(l["source"], l["target"]) for l in payload["links"]}
+    assert ("known", "unknown") in pairs
 
 
 # ── _proposed_group_regions (the before/after "after" half) ────────────────

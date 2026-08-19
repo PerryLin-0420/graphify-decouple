@@ -28,9 +28,13 @@ one pinned script is one less supply-chain surface.
 Honest limits, surfaced in the page itself:
   - Floors come from `data_floor`, a NAME heuristic for the I/O boundary,
     not I/O analysis. A wrong floor 0 shifts everything above it.
-  - A node with no known floor (no boundary reachable in its component) is
-    NOT drawn on a plane — it is omitted from the stack rather than
-    defaulted to floor 0.
+  - A region with no known floor (no boundary reachable from any of its
+    members) is never defaulted to floor 0 — it is rendered on its own
+    dedicated "unknown" band below the numbered stack instead of being
+    dropped outright. Dropping it silently erased every real link to or
+    from it too: a well-connected unit whose only calls happen to land on
+    other floor-unknown units looked completely disconnected for a reason
+    that had nothing to do with its actual connectivity.
 """
 from __future__ import annotations
 
@@ -80,12 +84,24 @@ def build_floor_scene(
         cx, cy, radius = class_discs[region_id]
         members = region_members.get(region_id, [])
         known = [floors[m] for m in [region_id, *members] if m in floors]
-        if not known:
-            continue  # no floor could be determined — omitted, not defaulted
-        counts: dict[int, int] = {}
-        for f in known:
-            counts[f] = counts.get(f, 0) + 1
-        dominant = min(counts, key=lambda f: (-counts[f], f))
+        # A region with NO determinable floor is NOT skipped — omitting it
+        # here doesn't just leave a class off the stack, it silently drops
+        # every link to or from it too (measured on a real corpus: 26 of 69
+        # regions had no reachable boundary, and their real neighbors — a
+        # test file with 37 genuine cross-file calls, a class with 5 —
+        # ended up looking completely disconnected in the 3D view, because
+        # the ONLY thing they call is something with no known floor). It is
+        # rendered on a dedicated `floor: None` band instead — never
+        # defaulted to floor 0, still visibly "not measured", but present
+        # so its real wiring stays visible.
+        if known:
+            counts: dict[int, int] = {}
+            for f in known:
+                counts[f] = counts.get(f, 0) + 1
+            dominant = min(counts, key=lambda f: (-counts[f], f))
+            min_floor, max_floor, spans = min(known), max(known), max(known) - min(known)
+        else:
+            dominant = min_floor = max_floor = spans = None
         if region_id.startswith("_module::"):
             label = region_id[len("_module::"):].rsplit("/", 1)[-1]
         else:
@@ -107,8 +123,8 @@ def build_floor_scene(
             "label": label,
             "x": cx, "y": cy, "r": radius,
             "floor": dominant,
-            "min_floor": min(known), "max_floor": max(known),
-            "spans": max(known) - min(known),
+            "min_floor": min_floor, "max_floor": max_floor,
+            "spans": spans,
             "color": community_colors[i % len(community_colors)],
             "member_count": len(members),
             "members": member_points,
@@ -130,8 +146,12 @@ def build_floor_scene(
     # A floor with nothing in either category (e.g. only rationale/test
     # nodes that never resolve to a region member) gets no Z-slot at all,
     # rather than reserving dead space for a floor nothing ever occupies.
+    # `None` (a region/member with no determinable floor) is excluded from
+    # the NUMBERED list — it gets its own fixed "unknown" band in the JS
+    # renderer (see floorZ), not a slot in the ranked stack.
     used_floors = sorted(
-        {r["floor"] for r in regions} | {m["floor"] for r in regions for m in r["members"]}
+        f for f in ({r["floor"] for r in regions} | {m["floor"] for r in regions for m in r["members"]})
+        if f is not None
     )
     return {"regions": regions, "links": links, "floors": used_floors, "_node_region": node_region}
 
@@ -198,14 +218,20 @@ def _page(scene_json: str, title: str, stats: str, has_proposed: bool) -> str:
   {decouple_toggle_html}
   <h3>Floors</h3>
   <div id="floor-list"></div>
+  <h3>Links</h3>
+  <div class="row"><span class="swatch" style="background:#f87171"></span>
+    <span>crosses floors</span></div>
+  <div class="row"><span class="swatch" style="background:#7dd3fc"></span>
+    <span>same floor (parallel)</span></div>
   <h3>Cross-floor regions</h3>
   <div id="span-list"></div>
   <div id="notes">
     <b>{stats}</b><br><br>
     Floor 0 is the I/O boundary (where data enters or leaves), detected by a
     <i>name heuristic</i> &mdash; not by I/O analysis. A wrong floor 0 shifts
-    everything above it. Units whose floor could not be determined are omitted
-    from the stack rather than defaulted to floor&nbsp;0.
+    everything above it. Units with no reachable boundary sit on the
+    <b>Unknown</b> band below floor&nbsp;0, never defaulted to floor&nbsp;0 &mdash;
+    still shown, and still wired to whatever they really connect to.
   </div>
 </div>
 <script>
@@ -235,11 +261,21 @@ const FLOOR_SPACING = Math.max(extent * 0.55, {_FLOOR_SPACING});
 // floor 10 must not leave 3 floor-spacings of dead air for floors 11-13
 // nothing was ever drawn on. `floor` fields elsewhere (labels, tooltips,
 // checkboxes) keep the raw number; only the Z height is rank-based.
-const floorZ = f => (SCENE.floor_rank[f] || 0) * FLOOR_SPACING;
+//
+// `null` (no boundary reachable from this unit at all) gets its own fixed
+// band a FULL extra spacing below floor 0, rather than a rank in the
+// numbered stack — it is not "floor -1", and folding it into the ranked
+// sequence would misreport an unmeasured unit as sitting one floor below
+// the I/O boundary itself. It still needs a real position, though:
+// dropping these units instead of giving them a Z at all is what silently
+// erased their links in the first place (see build_floor_scene).
+const UNKNOWN_Z = -1.5 * FLOOR_SPACING;
+const floorZ = f => f === null ? UNKNOWN_Z : (SCENE.floor_rank[f] || 0) * FLOOR_SPACING;
 
 // ---- build geometry -------------------------------------------------------
 const byFloor = new Map();
 SCENE.floors.forEach(f => byFloor.set(f, []));
+byFloor.set(null, []);
 
 function addToFloor(f, obj) {{
   if (!byFloor.has(f)) byFloor.set(f, []);
@@ -257,6 +293,17 @@ SCENE.floors.forEach(f => {{
   grid.material.transparent = true;
   addToFloor(f, grid);
 }});
+// The "unknown" band's own grid, drawn ONLY if some region actually needs
+// it — a reddish, sparser grid so it reads as "not a real measured floor"
+// rather than blending into the numbered stack.
+if (SCENE.regions.some(r => r.floor === null)) {{
+  const grid = new THREE.GridHelper(extent * 2.2, 8, 0x5e3a3a, 0x241c24);
+  grid.rotation.x = Math.PI / 2;
+  grid.position.z = UNKNOWN_Z;
+  grid.material.opacity = 0.22;
+  grid.material.transparent = true;
+  addToFloor(null, grid);
+}}
 
 // Region discs + their member points, on the region's own floor.
 // `r.state` is "before" (today's real classes/modules) or "after" (a
@@ -331,20 +378,36 @@ function addLinkSet(linkList, linkState) {{
     const a = regionById.get(l.source), b = regionById.get(l.target);
     if (!a || !b) return;
     const crosses = a.floor !== b.floor;
+    // A same-floor link runs between two discs at the SAME Z, so drawn at
+    // floorZ exactly it is coplanar with both discs and the floor grid —
+    // buried inside the semi-transparent disc surface and invisible, which
+    // made a split whose groups are all parallel (no cross-floor wiring at
+    // all) look like it had no wiring whatsoever. Lifting it clear of the
+    // plane is what makes "these units talk to each other WITHIN one
+    // stage" readable at all; cross-floor links are already slanted, so
+    // they need no lift.
+    const lift = crosses ? 0 : FLOOR_SPACING * 0.04;
     const geo = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(a.x, a.y, floorZ(a.floor)),
-      new THREE.Vector3(b.x, b.y, floorZ(b.floor)),
+      new THREE.Vector3(a.x, a.y, floorZ(a.floor) + lift),
+      new THREE.Vector3(b.x, b.y, floorZ(b.floor) + lift),
     ]);
-    const baseOpacity = crosses ? 0.7 : 0.35;
+    const baseOpacity = crosses ? 0.7 : 0.6;
     const line = new THREE.Line(geo, new THREE.LineBasicMaterial({{
-      color: crosses ? 0xf87171 : 0x64748b,
+      // Red still means "crosses floors" (the risk this view exists to
+      // show); same-floor wiring is deliberately a neutral, non-alarming
+      // colour — but a legible one, not near-invisible grey.
+      color: crosses ? 0xf87171 : 0x7dd3fc,
       transparent: true,
       opacity: baseOpacity,
     }}));
     // A cross-floor link belongs to BOTH floors for visibility purposes —
     // register it under the lower one, and hide it when either end hides.
+    // Math.min would silently coerce a `null` (unknown) end to 0 and file
+    // the link under floor 0 — if EITHER end is unknown, the link belongs
+    // in the unknown band instead, same as an unknown region's own disc.
     line.userData = {{ crosses, pairFloors: [a.floor, b.floor], linkState, source: l.source, target: l.target, baseOpacity }};
-    addToFloor(Math.min(a.floor, b.floor), line);
+    const bucketFloor = (a.floor === null || b.floor === null) ? null : Math.min(a.floor, b.floor);
+    addToFloor(bucketFloor, line);
     allLinkLines.push(line);
   }});
 }}
@@ -455,6 +518,7 @@ if (decoupleCb) {{
 
 // ---- floor visibility toggles --------------------------------------------
 const visibleFloors = new Set(SCENE.floors);
+visibleFloors.add(null);  // the "unknown" band starts visible too
 function applyVisibility() {{
   byFloor.forEach((objs, f) => {{
     objs.forEach(o => {{
@@ -491,6 +555,19 @@ SCENE.floors.forEach(f => {{
   }});
   floorList.appendChild(row);
 }});
+if (SCENE.regions.some(r => r.floor === null)) {{
+  const n = SCENE.regions.filter(r => r.floor === null && r.state !== 'after').length;
+  const row = document.createElement('label');
+  row.className = 'row';
+  row.innerHTML = '<input type="checkbox" checked data-floor="unknown">'
+    + '<span>Unknown <span class="muted">(no boundary reachable)</span></span>'
+    + '<span class="muted" style="margin-left:auto">' + n + '</span>';
+  row.querySelector('input').addEventListener('change', e => {{
+    if (e.target.checked) visibleFloors.add(null); else visibleFloors.delete(null);
+    applyVisibility();
+  }});
+  floorList.appendChild(row);
+}}
 
 const spanList = document.getElementById('span-list');
 const spanning = SCENE.regions.filter(r => r.spans > 0).sort((a, b) => b.spans - a.spans);
@@ -525,7 +602,8 @@ renderer.domElement.addEventListener('mousemove', e => {{
     tip.style.display = 'block';
     tip.style.left = (e.clientX - rect.left + 12) + 'px';
     tip.style.top = (e.clientY - rect.top + 10) + 'px';
-    tip.textContent = d.label + ' — floor ' + d.floor + ', ' + d.n + ' members'
+    const floorText = d.floor === null ? 'unknown (no boundary reachable)' : d.floor;
+    tip.textContent = d.label + ' — floor ' + floorText + ', ' + d.n + ' members'
       + (d.spans ? ' (spans ' + (d.spans + 1) + ' floors)' : '');
   }} else {{
     tip.style.display = 'none';
@@ -625,9 +703,12 @@ def _proposed_group_regions(
         if n == 0:
             continue
         for gi, g in enumerate(non_residual):
+            # A group with no determinable floor (fp is None) is still
+            # rendered — on the same `floor: None` "unknown" band
+            # build_floor_scene uses — rather than dropped outright, for
+            # the identical reason: dropping it would silently erase every
+            # link to or from it too, not just its own disc.
             fp = g.get("floor_profile")
-            if fp is None:
-                continue  # decouple_plan couldn't determine this group's floor — omitted, not defaulted
             members = g.get("members", [])
 
             angle = 2 * math.pi * gi / n
@@ -653,9 +734,10 @@ def _proposed_group_regions(
                 "id": region_id,
                 "label": g.get("name", f"Group {gi}"),
                 "x": gx, "y": gy, "r": gradius,
-                "floor": fp["floor"],
-                "min_floor": fp["min_floor"], "max_floor": fp["max_floor"],
-                "spans": fp["floor_span"],
+                "floor": fp["floor"] if fp else None,
+                "min_floor": fp["min_floor"] if fp else None,
+                "max_floor": fp["max_floor"] if fp else None,
+                "spans": fp["floor_span"] if fp else None,
                 "color": "#22c55e",  # same green family as the 2D "proposed split" diamond
                 "member_count": len(members),
                 "members": member_points,
@@ -708,9 +790,14 @@ def write_decouple_3d_html(
     # Recomputed over ALL regions (before + after), same rule as
     # build_floor_scene: a floor gets a Z-slot only if something (a
     # region's own floor, or one of its members') actually lands there.
+    # None (unknown floor) is excluded from the numbered list — see
+    # build_floor_scene for why it gets a fixed band instead of a rank.
     payload["floors"] = sorted(
-        {r["floor"] for r in payload["regions"]}
-        | {m["floor"] for r in payload["regions"] for m in r["members"]}
+        f for f in (
+            {r["floor"] for r in payload["regions"]}
+            | {m["floor"] for r in payload["regions"] for m in r["members"]}
+        )
+        if f is not None
     )
     # Dense rank for the Z axis — collapses gaps between occupied floors
     # (e.g. raw floors {0,1,...,6,8,10,14,...} become ranks 0,1,...,6,7,8,9,...)
@@ -734,7 +821,7 @@ def write_decouple_3d_html(
     else:
         payload["links_after"] = payload["links"]
 
-    n_span = sum(1 for r in payload["regions"] if r["state"] == "before" and r["spans"] > 0)
+    n_span = sum(1 for r in payload["regions"] if r["state"] == "before" and (r["spans"] or 0) > 0)
     n_proposed = len(after_regions)
     stats = (
         f"{len(payload['regions']) - n_proposed} units across {len(payload['floors'])} floors; "

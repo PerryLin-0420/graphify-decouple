@@ -158,6 +158,39 @@ def test_method_edge_still_carries_the_chain_through_a_class():
     assert floors["build"] == 2  # one real call hop past the class, not two
 
 
+def test_intra_module_calls_do_not_add_floors():
+    """A chain of calls inside ONE source file describes that module's own
+    internal composition, not data moving through stages. The real case:
+    `FilesPanel.set_sources() -> _FileRow -> _populate_detail_panel()` sat
+    on three consecutive floors, all inside files_panel.py. Here a->b->c
+    are all in panel.py and must share one floor; only the cross-file hop
+    into the boundary's module costs anything."""
+    g = nx.DiGraph()
+    _code(g, "boundary", "load_config()", source_file="app/core/thing.py")
+    _code(g, "a", "outer()", source_file="app/ui/panel.py")
+    _code(g, "b", "middle()", source_file="app/ui/panel.py")
+    _code(g, "c", "inner()", source_file="app/ui/panel.py")
+    g.add_edge("a", "b", relation="calls")  # intra-module: free
+    g.add_edge("b", "c", relation="calls")  # intra-module: free
+    g.add_edge("c", "boundary", relation="calls")  # crosses modules: costs 1
+    floors, _ = compute_floors(g)
+    assert floors["a"] == floors["b"] == floors["c"] == 1
+
+
+def test_cross_module_calls_still_cost_a_floor_each():
+    """The intra-module discount must not flatten genuinely separate
+    modules — each hop between different files still costs one floor."""
+    g = nx.DiGraph()
+    _code(g, "boundary", "load_config()", source_file="app/io/thing.py")
+    _code(g, "a", "a()", source_file="app/one.py")
+    _code(g, "b", "b()", source_file="app/two.py")
+    g.add_edge("a", "b", relation="calls")
+    g.add_edge("b", "boundary", relation="calls")
+    floors, _ = compute_floors(g)
+    assert floors["b"] == 1
+    assert floors["a"] == 2
+
+
 def test_mutually_calling_pair_shares_one_floor():
     """a and b call each other (a genuine cycle, not a chain) — they form
     one strongly-connected component and must share a single floor rather
@@ -190,6 +223,81 @@ def test_unreachable_component_has_no_floor_rather_than_zero():
     floors, _ = compute_floors(g)
     assert floors == {"parser": 0}
     assert "island" not in floors  # absent, NOT floor 0
+
+
+# ── rescue pass: floor via a known-floor CALLER, not just own calls ─────────
+
+def test_a_leaf_constructed_by_the_boundary_is_rescued_to_floor_one():
+    """TraceSource(parsed_data), built directly inside a parser, makes no
+    calls of its own that reach anywhere — the main pass leaves it with no
+    floor. But being constructed BY a floor-0 function is real evidence of
+    proximity, rescued to floor max(1, 0-1)=1 — never floor 0 itself, which
+    is reserved for the boundary, not merely something built next to it."""
+    g = nx.DiGraph()
+    _code(g, "parser", "parse_file()", source_file="app/parser/p.py")
+    _code(g, "tracesource", "TraceSource", source_file="app/model/trace_source.py")
+    g.add_edge("parser", "tracesource", relation="calls")
+    floors, _ = compute_floors(g)
+    assert floors["tracesource"] == 1
+
+
+def test_rescue_uses_the_closest_caller_not_the_farthest():
+    """A shared utility called by both a floor-0 boundary AND some deep,
+    unrelated floor-4 orchestrator must be rescued via the CLOSE evidence
+    (floor 0 caller), not dragged down by the deep one — the rescue pass
+    asks "is there close evidence", the opposite question from the main
+    pass's "what is the worst dependency", so it takes the MIN caller."""
+    g = nx.DiGraph()
+    _code(g, "boundary", "load_config()", source_file="app/core/thing.py")
+    for name in ("n1", "n2", "n3", "n4"):
+        _code(g, name, f"{name}()", source_file=f"app/core/{name}.py")
+    g.add_edge("n1", "boundary", relation="calls")
+    g.add_edge("n2", "n1", relation="calls")
+    g.add_edge("n3", "n2", relation="calls")
+    g.add_edge("n4", "n3", relation="calls")  # n4 sits at floor 4
+
+    _code(g, "util", "SharedUtil", source_file="app/util/shared.py")
+    g.add_edge("boundary", "util", relation="calls")  # close: floor-0 caller
+    g.add_edge("n4", "util", relation="calls")  # far: floor-4 caller
+
+    floors, _ = compute_floors(g)
+    assert floors["n4"] == 4
+    assert floors["util"] == 1  # rescued via boundary (min caller), not n4
+
+
+def test_rescue_and_main_pass_alternate_to_extend_a_chain():
+    """A unit rescued via a known-floor CALLER is not the end of the
+    story: once `a` is rescued to floor 1 (boundary constructs it
+    directly), `b` — which calls `a` in the NORMAL orchestration sense —
+    must extend outward through the MAIN pass's own rule (floor(caller) =
+    floor(callee) + 1), landing on floor 2, not get capped at 1 by the
+    rescue rule too. `c`, which calls `b`, continues the same way to floor
+    3. Rescue seeds a starting point; the main pass still governs normal
+    call chains built on top of it."""
+    g = nx.DiGraph()
+    _code(g, "boundary", "load_config()", source_file="app/core/thing.py")
+    _code(g, "a", "A", source_file="app/model/a.py")
+    _code(g, "b", "B", source_file="app/model/b.py")
+    _code(g, "c", "C", source_file="app/model/c.py")
+    g.add_edge("boundary", "a", relation="calls")  # a is constructed BY the boundary
+    g.add_edge("b", "a", relation="calls")  # b calls a normally
+    g.add_edge("c", "b", relation="calls")  # c calls b normally
+    floors, _ = compute_floors(g)
+    assert floors["a"] == 1  # rescued: boundary (floor 0) constructs it
+    assert floors["b"] == 2  # normal caller-direction growth on top of the rescue
+    assert floors["c"] == 3
+
+
+def test_rescue_does_not_apply_to_a_unit_with_no_known_floor_caller_either():
+    """A unit whose only caller ALSO has no floor stays unfloored — the
+    rescue pass requires real evidence (a caller that is itself
+    positioned), not a chain of mutual guesses."""
+    g = nx.DiGraph()
+    _code(g, "a", "A", source_file="app/model/a.py")
+    _code(g, "b", "B", source_file="app/model/b.py")
+    g.add_edge("b", "a", relation="calls")  # neither reaches any boundary
+    floors, _ = compute_floors(g)
+    assert floors == {}
 
 
 def test_floors_used_are_always_contiguous_no_gap_floors():
@@ -263,3 +371,34 @@ def test_cross_floor_risk_grows_with_span_and_is_zero_for_unknown():
     assert cross_floor_risk({"floor_span": 2}) == 50.0
     # unknown profile is NOT scored as clean-and-penalized, it is skipped
     assert cross_floor_risk(None) == 0.0
+
+
+def test_profile_reports_how_much_of_the_unit_was_measured():
+    """`floor_evidence` is the share of members whose floor is known. A
+    proposed group is passed class_id=None and has no class node of its
+    own, so counting one would understate its evidence."""
+    g = nx.DiGraph()
+    _code(g, "cls", "Dialog", source_file="app/ui/d.py")
+    floors = {"cls": 1, "m0": 0, "m1": 2}
+    # class: 3 of 4 known (cls + 3 members)
+    profile = class_floor_profile(g, "cls", ["m0", "m1", "m2"], floors)
+    assert profile["members_total"] == 4
+    assert profile["floor_evidence"] == 0.75
+    # group (class_id=None): 2 of 3 members known, no phantom class node
+    group = class_floor_profile(g, None, ["m0", "m1", "m2"], floors)
+    assert group["members_total"] == 3
+    assert group["floor_evidence"] == round(2 / 3, 2)
+
+
+def test_cross_floor_risk_scales_down_when_span_rests_on_few_members():
+    """The weakest evidence must not produce the strongest penalty. The
+    same span of 4 scores full risk when every member was measured, and
+    proportionally less when the span rests on a fraction of them — the
+    real case this guards: a span of 6 built from 3 of 7 members added 30
+    points of split risk and flipped a class's verdict."""
+    fully_measured = {"floor_span": 4, "floor_evidence": 1.0}
+    barely_measured = {"floor_span": 4, "floor_evidence": 0.25}
+    assert cross_floor_risk(fully_measured) == 100.0
+    assert cross_floor_risk(barely_measured) == 25.0
+    # a profile without the field predates the weighting — not silently zeroed
+    assert cross_floor_risk({"floor_span": 4}) == 100.0

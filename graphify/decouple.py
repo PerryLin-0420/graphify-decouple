@@ -887,11 +887,15 @@ def decouple_plan(
             "boundary (not the shortest), computed on the graph's strongly-"
             "connected-component condensation so a genuine call cycle shares "
             "one floor instead of having no defined longest path. Only "
-            "runtime edges count, and they are weighted: an invocation costs "
-            "one floor, while a `method` edge (class-owns-method, i.e. two "
-            "granularities of ONE unit rather than two pipeline stages) "
-            "costs zero, so a class shares a floor with its own methods "
-            "instead of reading as one floor below its own __init__. "
+            "runtime edges count, and they are weighted: a call BETWEEN "
+            "modules costs one floor, while two kinds of hop that move "
+            "WITHIN one unit cost zero — a `method` edge (class-owns-method) "
+            "and a call whose both ends live in the SAME source file. Both "
+            "describe one unit's internal composition rather than two "
+            "pipeline stages; without the discount a single UI widget's own "
+            "internals read as three floors of pipeline depth. The honest "
+            "limit is the mirror image: a genuinely large module that really "
+            "does run several stages internally collapses to one floor. "
             "Documentation, import and containment edges are excluded "
             "outright. The "
             "boundary itself is detected by a NAME heuristic (path tokens + "
@@ -905,7 +909,16 @@ def decouple_plan(
             "but it is the only direction available to measure along. A "
             "class with no floor_profile was NOT measured (no boundary "
             "reachable), which is not the same as sitting on a single floor "
-            "— its risk_before carries no cross-floor term either way.",
+            "— its risk_before carries no cross-floor term either way. "
+            "cross_floor_risk is scaled by floor_evidence (the share of the "
+            "unit's members with a known floor), because span and evidence "
+            "are inversely related on real graphs — a handful of scattered "
+            "known-floor points among many unknowns can produce a large span "
+            "on thin evidence, while a fully-measured unit usually turns out "
+            "to sit on one floor. A span measured over 25% of members scores "
+            "a quarter of what the same span scores when every member is "
+            "known, so the weakest evidence cannot produce the strongest "
+            "penalty.",
             "Each proposed group ALSO gets its own floor_profile (attached "
             "once, here, and read — never recomputed — by split_risk_score "
             "and by decouple_3d.py's before/after view). max_group_floor_risk "
@@ -1671,7 +1684,8 @@ def render_markdown(plan: dict[str, Any]) -> str:
         if fp:
             span_note = (
                 f" — straddles {fp['floor_span'] + 1} data-flow floors "
-                f"(cross_floor_risk={entry.get('floor_risk')})"
+                f"(cross_floor_risk={entry.get('floor_risk')}, "
+                f"measured over {fp.get('floor_evidence', 1.0):.0%} of members)"
                 if fp["floor_span"] else " — single floor"
             )
             lines.append(
@@ -1723,7 +1737,11 @@ def render_markdown(plan: dict[str, Any]) -> str:
                 if fp:
                     lines.append(
                         f"- floor={fp['floor']} (range {fp['min_floor']}-{fp['max_floor']})"
-                        + (f" — still spans {fp['floor_span'] + 1} floors" if fp["floor_span"] else " — single floor")
+                        + (
+                            f" — still spans {fp['floor_span'] + 1} floors "
+                            f"(measured over {fp.get('floor_evidence', 1.0):.0%} of members)"
+                            if fp["floor_span"] else " — single floor"
+                        )
                     )
                 for lbl in g["member_labels"]:
                     lines.append(f"- {lbl}")
