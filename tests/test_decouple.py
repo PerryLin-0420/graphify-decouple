@@ -18,10 +18,12 @@ from networkx.readwrite import json_graph
 
 import graphify.__main__ as mainmod
 from graphify.decouple import (
+    annotate_consolidation_risk,
     balance_risk,
     build_augmented_graph,
     candidate_groups,
     classify_god_node,
+    consolidation_risk_score,
     decouple_plan,
     hub_suggestion,
     member_ids,
@@ -594,6 +596,110 @@ def test_build_augmented_graph_hulls_cover_every_class_not_just_god_nodes():
     # every class WITH members, regardless of what the plan looked at
     assert labels == {"GodClass", "BigClass", "TangledClass", "PipelineClass"}
     assert "HubClass" not in labels  # no members -> no region to draw
+
+
+# ── consolidation_risk_score / annotate_consolidation_risk ──────────────────
+
+def _dedup_cluster(n_members, avg_jaccard=1.0, source_files=None):
+    files = source_files or [f"f{i}.py" for i in range(n_members)]
+    return {
+        "members": [_dup_member(files[i], "helper") for i in range(n_members)],
+        "avg_jaccard": avg_jaccard,
+        "merge_target": {"recommendation": "independent", "target_container": None,
+                          "target_source_file": None, "candidates": [], "rationale": "x"},
+    }
+
+
+def test_consolidation_benefit_grows_with_copies_and_confidence():
+    g = nx.DiGraph()
+    g.add_node("a"); g.add_node("b")
+    low_conf = consolidation_risk_score(g, _dedup_cluster(2, avg_jaccard=0.5), ["a", "b"], {})
+    high_conf = consolidation_risk_score(g, _dedup_cluster(2, avg_jaccard=1.0), ["a", "b"], {})
+    assert high_conf["consolidation_benefit"] > low_conf["consolidation_benefit"]
+
+
+def test_consolidation_risk_grows_with_afferent_concentration():
+    g = nx.DiGraph()
+    for i in range(6):
+        g.add_node(f"caller{i}")
+    g.add_node("a"); g.add_node("b")
+    for i in range(6):
+        g.add_edge(f"caller{i}", "a" if i < 3 else "b")
+    heavy = consolidation_risk_score(g, _dedup_cluster(2), ["a", "b"], {})
+
+    g2 = nx.DiGraph()
+    g2.add_node("a"); g2.add_node("b")
+    light = consolidation_risk_score(g2, _dedup_cluster(2), ["a", "b"], {})
+    assert heavy["consolidation_risk"] > light["consolidation_risk"]
+    assert heavy["afferent_total"] == 6
+
+
+def test_consolidation_risk_grows_with_floor_span():
+    g = nx.DiGraph()
+    g.add_node("a"); g.add_node("b")
+    spanning = consolidation_risk_score(g, _dedup_cluster(2), ["a", "b"], {"a": 0, "b": 3})
+    same_floor = consolidation_risk_score(g, _dedup_cluster(2), ["a", "b"], {"a": 1, "b": 1})
+    assert spanning["consolidation_risk"] > same_floor["consolidation_risk"]
+    assert spanning["floor_span"] == 3
+    assert spanning["floor_span_known"] is True
+
+
+def test_consolidation_floor_span_unknown_is_not_penalized_as_verified_clean():
+    g = nx.DiGraph()
+    g.add_node("a"); g.add_node("b")
+    unknown = consolidation_risk_score(g, _dedup_cluster(2), ["a", "b"], {})
+    assert unknown["floor_span_known"] is False
+    assert unknown["floor_span"] == 0
+
+
+def test_consolidation_verdict_recommends_consolidate_for_cheap_confident_merge():
+    g = nx.DiGraph()
+    g.add_node("a"); g.add_node("b"); g.add_node("c")
+    result = consolidation_risk_score(g, _dedup_cluster(3, avg_jaccard=1.0), ["a", "b", "c"], {})
+    assert result["recommendation"] == "consolidate"
+    assert result["net_benefit"] > 0
+
+
+def test_consolidation_verdict_keeps_separate_for_low_confidence_heavily_used_copies():
+    g = nx.DiGraph()
+    for i in range(20):
+        g.add_node(f"caller{i}")
+    g.add_node("a"); g.add_node("b")
+    for i in range(20):
+        g.add_edge(f"caller{i}", "a" if i < 10 else "b")
+    result = consolidation_risk_score(g, _dedup_cluster(2, avg_jaccard=0.5), ["a", "b"], {"a": 0, "b": 4})
+    assert result["recommendation"] == "keep_separate"
+    assert result["net_benefit"] < 0
+
+
+def test_annotate_consolidation_risk_skips_unresolvable_clusters():
+    g = nx.DiGraph()
+    g.add_node("only_one", label="helper()", file_type="code", source_file="a.py")
+    report = {"clusters": [{
+        "members": [_dup_member("a.py", "helper"), _dup_member("nonexistent.py", "helper")],
+        "avg_jaccard": 1.0,
+        "merge_target": {"recommendation": "independent", "target_container": None,
+                          "target_source_file": None, "candidates": [], "rationale": "x"},
+    }]}
+    annotate_consolidation_risk(g, report, {})
+    assert "consolidation_risk" not in report["clusters"][0]
+
+
+def test_annotate_consolidation_risk_attaches_verdict_when_resolvable():
+    g = nx.DiGraph()
+    g.add_node("a", label="helper()", file_type="code", source_file="a.py")
+    g.add_node("b", label="helper()", file_type="code", source_file="b.py")
+    report = {"clusters": [{
+        "members": [_dup_member("a.py", "helper"), _dup_member("b.py", "helper")],
+        "avg_jaccard": 1.0,
+        "merge_target": {"recommendation": "independent", "target_container": None,
+                          "target_source_file": None, "candidates": [], "rationale": "x"},
+    }]}
+    annotate_consolidation_risk(g, report, {})
+    assert "consolidation_risk" in report["clusters"][0]
+    assert report["clusters"][0]["consolidation_risk"]["recommendation"] in (
+        "consolidate", "marginal", "keep_separate",
+    )
 
 
 def test_write_decouple_html_reuses_visjs_style(tmp_path):

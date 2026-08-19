@@ -2239,6 +2239,8 @@ def dispatch_command(cmd: str) -> None:
         as_json = "--json" in sys.argv
         no_html = "--no-html" in sys.argv
         no_state_check = "--no-state-check" in sys.argv
+        no_dedup = "--no-dedup" in sys.argv
+        want_3d = "--3d" in sys.argv
         args = sys.argv[2:]
         i = 0
         while i < len(args):
@@ -2282,6 +2284,8 @@ def dispatch_command(cmd: str) -> None:
                 print("  --output-dir DIR        output dir for DECOUPLE_PLAN.md/decouple.json/DECOUPLE.html (default: graph.json's directory)")
                 print("  --json                  print decouple.json to stdout instead of writing files")
                 print("  --no-html               skip DECOUPLE.html generation")
+                print("  --no-dedup              skip the corpus-wide near-duplicate function scan (graphify.tool_dedup)")
+                print("  --3d                    also write DECOUPLE_3D.html — data-flow floors stacked on Z (graphify.decouple_3d)")
                 return
             else:
                 i += 1
@@ -2325,22 +2329,67 @@ def dispatch_command(cmd: str) -> None:
             top_n=top_n, min_group_size=min_group_size, extracted_only=extracted_only,
             net_benefit_threshold=net_benefit_threshold, project_root=resolved_root,
         )
+
+        # Corpus-wide near-duplicate scan (graphify.tool_dedup) — a standard
+        # part of `decouple` now, not a separate script: it answers a
+        # question decouple_plan's god-node ranking structurally cannot
+        # (scattered low-degree duplicates never rank high enough to be a
+        # god node candidate on their own). Needs an actual directory on
+        # disk to scan, so it is skipped — with a printed reason, not
+        # silently — when there is no resolved project root to scan
+        # (`--no-state-check` was passed, or nothing was resolvable) or
+        # when explicitly disabled.
+        dedup_report: "dict[str, Any] | None" = None
+        if not no_dedup and resolved_root is not None:
+            from graphify.data_floor import compute_floors
+            from graphify.decouple import annotate_consolidation_risk
+            from graphify.tool_dedup import discover_source_files, find_duplicate_function_clusters
+            dedup_files = discover_source_files(resolved_root)
+            dedup_report = find_duplicate_function_clusters(resolved_root, dedup_files)
+            # Resolves each cluster back to real graph nodes and attaches a
+            # consolidation risk/benefit verdict (see
+            # decouple.consolidation_risk_score) — kept as its OWN verdict,
+            # never mixed into a god node's risk_before/risk_after (a
+            # merge's cost/benefit is answered at corpus scale, a split's
+            # at single-class scale).
+            floors, _floor_reasons = compute_floors(G)
+            dedup_report = annotate_consolidation_risk(G, dedup_report, floors)
+        elif not no_dedup:
+            print("skipping duplicate-function scan: no project root resolved (see --no-state-check/--project-root)", file=sys.stderr)
+
         if as_json:
-            print(json.dumps(plan, indent=2, ensure_ascii=False))
+            out = dict(plan)
+            if dedup_report is not None:
+                out["tool_dedup"] = dedup_report
+            print(json.dumps(out, indent=2, ensure_ascii=False))
             return
         out_dir = output_dir or graph_path.parent
         out_dir.mkdir(parents=True, exist_ok=True)
         md_path = out_dir / "DECOUPLE_PLAN.md"
         json_path = out_dir / "decouple.json"
-        md_path.write_text(render_markdown(plan), encoding="utf-8")
-        _wja(json_path, plan, indent=2, ensure_ascii=False)
+        md_text = render_markdown(plan)
+        json_payload = dict(plan)
+        if dedup_report is not None:
+            from graphify.tool_dedup import render_markdown as render_dedup_markdown
+            md_text += "\n\n---\n\n" + render_dedup_markdown(dedup_report)
+            json_payload["tool_dedup"] = dedup_report
+        md_path.write_text(md_text, encoding="utf-8")
+        _wja(json_path, json_payload, indent=2, ensure_ascii=False)
         print(f"wrote {md_path}")
         print(f"wrote {json_path}")
         if not no_html:
             from graphify.decouple_html import write_decouple_html
             html_path = out_dir / "DECOUPLE.html"
-            write_decouple_html(G, plan, communities, community_labels, html_path)
+            write_decouple_html(G, plan, communities, community_labels, html_path, tool_dedup_report=dedup_report)
             print(f"wrote {html_path}")
+        if want_3d:
+            from graphify.decouple_3d import write_decouple_3d_html
+            html_3d_path = out_dir / "DECOUPLE_3D.html"
+            written = write_decouple_3d_html(G, plan, communities, html_3d_path)
+            if written:
+                print(f"wrote {written}")
+            else:
+                print("skipping DECOUPLE_3D.html: no I/O-boundary floor detected in this graph", file=sys.stderr)
         god_entries = [e for e in plan["god_nodes"] if e["classification"] == "god_object"]
         n_hub = sum(1 for e in plan["god_nodes"] if e["classification"] == "over_referenced_hub")
         n_cohesive = len(plan["god_nodes"]) - len(god_entries) - n_hub

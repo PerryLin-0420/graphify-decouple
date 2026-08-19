@@ -52,6 +52,7 @@ _FLOOR_SPACING = 900.0  # world units between adjacent floor planes
 def build_floor_scene(
     G: nx.Graph,
     class_discs: dict[str, tuple[float, float, float]],
+    cluster_positions: dict[str, dict[str, float]],
     region_members: dict[str, list[str]],
     floors: dict[str, int],
     community_colors: list[str],
@@ -60,9 +61,14 @@ def build_floor_scene(
 
     Each region (class or module — see `decouple._class_cluster_layout`) is
     placed on the floor its own members predominantly occupy, reusing the
-    SAME packed (x, y) disc the 2D view uses so the two views are directly
-    comparable: a region sits at the same place on the map in both, only
-    lifted onto its floor here.
+    SAME packed (x, y) disc AND the SAME per-member scatter positions the
+    2D view uses (`cluster_positions`) — not a fresh layout recomputed in
+    JS. A region sits at the exact same place, with its members in the
+    exact same arrangement, in both views; only the floor (Z) lift is new
+    here. Recomputing the scatter independently in JS (an earlier version
+    of this module did, with a simple sine-hash) drifted from the 2D
+    layout and produced a visibly regular-looking pattern of its own —
+    a second, gratuitous layout algorithm neither view asked for.
 
     A region whose members span several floors is placed on its dominant
     floor and flagged `spans` with the range — that is the case the whole
@@ -88,9 +94,13 @@ def build_floor_scene(
         for m in members:
             if m not in G.nodes:
                 continue
+            pos = cluster_positions.get(m)
+            if pos is None:
+                continue
             member_points.append({
                 "label": str(G.nodes[m].get("label", m)),
                 "floor": floors.get(m, dominant),
+                "x": pos["x"], "y": pos["y"],
             })
         regions.append({
             "id": region_id,
@@ -112,24 +122,47 @@ def build_floor_scene(
         for m in [region_id, *members]:
             node_region[m] = region_id
     region_ids = {r["id"] for r in regions}
+    links = _aggregate_region_links(G, node_region, region_ids)
+
+    used_floors = sorted({r["floor"] for r in regions})
+    return {"regions": regions, "links": links, "floors": used_floors, "_node_region": node_region}
+
+
+def _aggregate_region_links(
+    G: nx.Graph,
+    node_region: dict[str, str],
+    valid_region_ids: set,
+) -> list[dict[str, Any]]:
+    """Collapse every underlying edge to ONE weighted line per
+    (region, region) pair — shared by the "before" link set
+    (`build_floor_scene`) and the "after" one (`write_decouple_3d_html`,
+    using a node_region map with extracted members redirected onto their
+    proposed group), so the two are built the exact same way and only
+    differ in which region each moved member is said to belong to.
+    """
     pair_counts: dict[tuple[str, str], int] = {}
     for u, v in G.edges():
         ru, rv = node_region.get(u), node_region.get(v)
         if ru is None or rv is None or ru == rv:
             continue
-        if ru not in region_ids or rv not in region_ids:
+        if ru not in valid_region_ids or rv not in valid_region_ids:
             continue
         pair_counts[(ru, rv)] = pair_counts.get((ru, rv), 0) + 1
-    links = [
+    return [
         {"source": a, "target": b, "weight": w}
         for (a, b), w in sorted(pair_counts.items())
     ]
 
-    used_floors = sorted({r["floor"] for r in regions})
-    return {"regions": regions, "links": links, "floors": used_floors}
 
-
-def _page(scene_json: str, title: str, stats: str) -> str:
+def _page(scene_json: str, title: str, stats: str, has_proposed: bool) -> str:
+    decouple_toggle_html = (
+        '<label class="row" style="padding:10px 14px;border-bottom:1px solid #2a2a4e">'
+        '<input type="checkbox" id="decouple-view-cb">'
+        '<span>Preview decoupled view</span>'
+        '<span class="muted" style="margin-left:auto">before/after</span>'
+        '</label>'
+        if has_proposed else ""
+    )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -152,8 +185,9 @@ def _page(scene_json: str, title: str, stats: str) -> str:
 </style>
 </head>
 <body>
-<div id="view"><div id="tip"></div><div id="hint">drag to rotate &middot; wheel to zoom &middot; shift+drag to pan</div></div>
+<div id="view"><div id="tip"></div><div id="hint">drag to rotate &middot; wheel to zoom &middot; shift+drag to pan &middot; click a region to highlight its connections</div></div>
 <div id="sidebar">
+  {decouple_toggle_html}
   <h3>Floors</h3>
   <div id="floor-list"></div>
   <h3>Cross-floor regions</h3>
@@ -212,64 +246,113 @@ SCENE.floors.forEach(f => {{
 }});
 
 // Region discs + their member points, on the region's own floor.
+// `r.state` is "before" (today's real classes/modules) or "after" (a
+// RECOMMENDED split's proposed group, from _proposed_group_regions) — every
+// mesh belonging to a region carries `regionId` so applyVisibility can gate
+// on before/after state, not just on which floor checkboxes are on.
 SCENE.regions.forEach(r => {{
   const color = new THREE.Color(r.color);
+  const isProposed = r.state === 'after';
   const disc = new THREE.Mesh(
     new THREE.CircleGeometry(r.r, 48),
-    new THREE.MeshBasicMaterial({{ color, transparent: true, opacity: 0.20, side: THREE.DoubleSide }})
+    new THREE.MeshBasicMaterial({{ color, transparent: true, opacity: isProposed ? 0.28 : 0.20, side: THREE.DoubleSide }})
   );
   disc.position.set(r.x, r.y, floorZ(r.floor));
-  disc.userData = {{ label: r.label, kind: 'region', spans: r.spans, floor: r.floor, n: r.member_count }};
+  disc.userData = {{ label: r.label, kind: 'region', spans: r.spans, floor: r.floor, n: r.member_count, regionId: r.id }};
   addToFloor(r.floor, disc);
 
-  const ring = new THREE.LineLoop(
-    new THREE.CircleGeometry(r.r, 48),
-    new THREE.LineBasicMaterial({{ color, transparent: true, opacity: 0.85 }})
-  );
+  // A dashed ring for a proposed group — same "not real yet" signal the 2D
+  // view's diamond ring uses — vs. a solid ring for an existing class/module.
+  // Built from a plain circumference point list, NOT THREE.CircleGeometry —
+  // that geometry's vertex buffer starts with a CENTER vertex (needed for
+  // its own triangle-fan fill), and a LineLoop just walks vertices in
+  // buffer order, so reusing it for an outline draws spokes from the
+  // center to the rim instead of a clean ring (exactly the "sunburst"
+  // pattern that made every disc look like it had radiating lines,
+  // independent of and on top of the actual region-to-region links).
+  const ringPts = [];
+  for (let i = 0; i <= 48; i++) {{
+    const a = (i / 48) * 2 * Math.PI;
+    ringPts.push(new THREE.Vector3(r.r * Math.cos(a), r.r * Math.sin(a), 0));
+  }}
+  const ringGeo = new THREE.BufferGeometry().setFromPoints(ringPts);
+  const ring = isProposed
+    ? new THREE.Line(ringGeo, new THREE.LineDashedMaterial({{ color, transparent: true, opacity: 0.9, dashSize: 14, gapSize: 8 }}))
+    : new THREE.Line(ringGeo, new THREE.LineBasicMaterial({{ color, transparent: true, opacity: 0.85 }}));
+  if (isProposed) ring.computeLineDistances();
   ring.position.copy(disc.position);
+  ring.userData = {{ regionId: r.id }};
   addToFloor(r.floor, ring);
 
-  // Members as points inside the disc — deterministic scatter mirroring the
-  // 2D view's, so a region looks like "the same place" in both views.
-  if (r.member_count) {{
+  // Members as points inside the disc, at the EXACT (x, y) the 2D view
+  // placed them at (see build_floor_scene) — not a separately recomputed
+  // scatter, so a region looks like the literal same place, member for
+  // member, in both views. A member off its own region's floor (it landed
+  // on a different one than the region's dominant floor) is lifted to
+  // ITS floor, not squashed onto the region's — that gap IS the
+  // cross-floor signal this view exists to show.
+  if (r.members && r.members.length) {{
     const positions = [];
-    for (let i = 0; i < r.member_count; i++) {{
-      const a = (Math.sin(i * 12.9898 + r.x) * 43758.5453) % 1;
-      const b = (Math.sin(i * 78.233 + r.y) * 43758.5453) % 1;
-      const ang = Math.abs(a) * Math.PI * 2;
-      const rad = Math.sqrt(Math.abs(b)) * r.r * 0.8;
-      positions.push(r.x + rad * Math.cos(ang), r.y + rad * Math.sin(ang), floorZ(r.floor));
-    }}
+    r.members.forEach(m => {{ positions.push(m.x, m.y, floorZ(m.floor)); }});
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
     const pts = new THREE.Points(geo, new THREE.PointsMaterial({{ color, size: 14, transparent: true, opacity: 0.95 }}));
+    pts.userData = {{ regionId: r.id }};
     addToFloor(r.floor, pts);
   }}
 }});
 
-// Region-to-region links. A link between different floors is drawn brighter
-// and thicker-looking (opacity) than a within-floor one: crossing floors is
-// the thing this view exists to surface.
+// Region-to-region links. Two SEPARATE link sets — SCENE.links ("before":
+// today's real wiring) and SCENE.links_after (every extracted member's
+// edges redirected onto its proposed group) — each tagged with linkState
+// so only the active half of "Preview decoupled view" ever draws.
+//
+// ALL links draw by default, same as the 2D view (which never hides an
+// edge either) — clicking a region does not hide anything, it HIGHLIGHTS
+// that region's own links and dims the rest (see updateLinkEmphasis),
+// mirroring vis-network's own node-selection emphasis in the 2D view.
 const regionById = new Map(SCENE.regions.map(r => [r.id, r]));
-SCENE.links.forEach(l => {{
-  const a = regionById.get(l.source), b = regionById.get(l.target);
-  if (!a || !b) return;
-  const crosses = a.floor !== b.floor;
-  const geo = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(a.x, a.y, floorZ(a.floor)),
-    new THREE.Vector3(b.x, b.y, floorZ(b.floor)),
-  ]);
-  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({{
-    color: crosses ? 0xf87171 : 0x64748b,
-    transparent: true,
-    opacity: crosses ? 0.55 : 0.18,
-  }}));
-  line.userData = {{ crosses, floors: [a.floor, b.floor] }};
-  // A cross-floor link belongs to BOTH floors for visibility purposes —
-  // register it under the lower one, and hide it when either end hides.
-  addToFloor(Math.min(a.floor, b.floor), line);
-  line.userData.pairFloors = [a.floor, b.floor];
-}});
+const allLinkLines = [];
+function addLinkSet(linkList, linkState) {{
+  linkList.forEach(l => {{
+    const a = regionById.get(l.source), b = regionById.get(l.target);
+    if (!a || !b) return;
+    const crosses = a.floor !== b.floor;
+    const geo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(a.x, a.y, floorZ(a.floor)),
+      new THREE.Vector3(b.x, b.y, floorZ(b.floor)),
+    ]);
+    const baseOpacity = crosses ? 0.7 : 0.35;
+    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({{
+      color: crosses ? 0xf87171 : 0x64748b,
+      transparent: true,
+      opacity: baseOpacity,
+    }}));
+    // A cross-floor link belongs to BOTH floors for visibility purposes —
+    // register it under the lower one, and hide it when either end hides.
+    line.userData = {{ crosses, pairFloors: [a.floor, b.floor], linkState, source: l.source, target: l.target, baseOpacity }};
+    addToFloor(Math.min(a.floor, b.floor), line);
+    allLinkLines.push(line);
+  }});
+}}
+addLinkSet(SCENE.links, 'before');
+addLinkSet(SCENE.links_after, 'after');
+let selectedRegionId = null;
+
+// Selecting a region HIGHLIGHTS its own links (full base opacity) and DIMS
+// every other link (a faint 0.04) rather than hiding anything — same
+// "everything stays visible, the click just draws attention" behavior the
+// 2D view gets for free from vis-network's node selection.
+function updateLinkEmphasis() {{
+  allLinkLines.forEach(line => {{
+    if (selectedRegionId == null) {{
+      line.material.opacity = line.userData.baseOpacity;
+      return;
+    }}
+    const touches = line.userData.source === selectedRegionId || line.userData.target === selectedRegionId;
+    line.material.opacity = touches ? line.userData.baseOpacity : 0.04;
+  }});
+}}
 
 // ---- camera + inline orbit controls --------------------------------------
 const target = new THREE.Vector3(0, 0, floorZ((SCENE.floors[0] + SCENE.floors[SCENE.floors.length - 1]) / 2));
@@ -288,10 +371,19 @@ function updateCamera() {{
   camera.lookAt(target.x + panX, target.y + panY, target.z);
 }}
 let dragging = false, shifted = false, lastX = 0, lastY = 0;
+let downX = 0, downY = 0;
 renderer.domElement.addEventListener('mousedown', e => {{
   dragging = true; shifted = e.shiftKey; lastX = e.clientX; lastY = e.clientY;
+  downX = e.clientX; downY = e.clientY;
 }});
-window.addEventListener('mouseup', () => {{ dragging = false; }});
+window.addEventListener('mouseup', e => {{
+  dragging = false;
+  // A "click" (barely moved between down and up) selects/deselects a
+  // region; anything that moved more was a rotate/pan drag, not a click.
+  if (Math.abs(e.clientX - downX) < 4 && Math.abs(e.clientY - downY) < 4) {{
+    handleRegionClick(e);
+  }}
+}});
 window.addEventListener('mousemove', e => {{
   if (!dragging) return;
   const dx = e.clientX - lastX, dy = e.clientY - lastY;
@@ -319,21 +411,58 @@ window.addEventListener('resize', resize);
 resize();
 updateCamera();
 
+// ---- before/after (decoupled preview) toggle ------------------------------
+// Mirrors the 2D view's "Preview decoupled view": OFF (default) shows
+// today's real classes/modules ("before"); ON hides every class with a
+// RECOMMENDED split and shows its proposed groups instead ("after"), each
+// on ITS OWN floor — the only way to actually SEE whether a proposed split
+// reduces cross-floor spread, rather than assuming a lower risk_before
+// number implies it (a community-based grouping optimizes for coupling,
+// not floor-coherence, so it is not guaranteed to).
+const replacedIds = new Set(SCENE.regions.filter(r => r.state === 'after').map(r => r.replaces));
+let showAfter = false;
+function regionStateVisible(regionId) {{
+  const r = regionById.get(regionId);
+  if (!r) return true;
+  if (r.state === 'after') return showAfter;
+  if (r.state === 'before' && replacedIds.has(r.id)) return !showAfter;
+  return true;
+}}
+const decoupleCb = document.getElementById('decouple-view-cb');
+if (decoupleCb) {{
+  decoupleCb.addEventListener('change', e => {{
+    showAfter = e.target.checked;
+    applyVisibility();
+  }});
+}}
+
 // ---- floor visibility toggles --------------------------------------------
 const visibleFloors = new Set(SCENE.floors);
 function applyVisibility() {{
   byFloor.forEach((objs, f) => {{
     objs.forEach(o => {{
       const pf = o.userData && o.userData.pairFloors;
-      // A cross-floor link is only meaningful when BOTH its ends are shown.
-      o.visible = pf ? (visibleFloors.has(pf[0]) && visibleFloors.has(pf[1]))
-                     : visibleFloors.has(f);
+      if (pf) {{
+        // Every link in the active half (before/after) is drawn whenever
+        // BOTH its ends are shown — same as the 2D view, which never hides
+        // an edge either. Selecting a region does not hide anything; it
+        // HIGHLIGHTS that region's own links and DIMS the rest (see
+        // updateLinkEmphasis) — the earlier "hide unless selected" answer
+        // over-corrected for a rendering bug (a bad ring geometry that
+        // made every disc sprout spokes, see the ring-building comment
+        // above) that had nothing to do with how many links were drawn.
+        const stateOk = (o.userData.linkState === 'after') === showAfter;
+        o.visible = stateOk && visibleFloors.has(pf[0]) && visibleFloors.has(pf[1]);
+        return;
+      }}
+      const rid = o.userData && o.userData.regionId;
+      o.visible = visibleFloors.has(f) && regionStateVisible(rid);
     }});
   }});
 }}
 const floorList = document.getElementById('floor-list');
 SCENE.floors.forEach(f => {{
-  const n = SCENE.regions.filter(r => r.floor === f).length;
+  const n = SCENE.regions.filter(r => r.floor === f && r.state !== 'after').length;
   const row = document.createElement('label');
   row.className = 'row';
   row.innerHTML = '<input type="checkbox" checked data-floor="' + f + '">'
@@ -386,7 +515,27 @@ renderer.domElement.addEventListener('mousemove', e => {{
   }}
 }});
 
+// Click a region disc to reveal ONLY its own links (see the link-drawing
+// comment above for why: an always-on link set is unreadable for any
+// genuine hub, not just busy). Click the same region again, or empty
+// space, to clear the selection back to "no links shown".
+function handleRegionClick(e) {{
+  const rect = renderer.domElement.getBoundingClientRect();
+  const mouse = new THREE.Vector2(
+    ((e.clientX - rect.left) / rect.width) * 2 - 1,
+    -((e.clientY - rect.top) / rect.height) * 2 + 1
+  );
+  ray.setFromCamera(mouse, camera);
+  const meshes = [];
+  byFloor.forEach(objs => objs.forEach(o => {{ if (o.visible && o.userData && o.userData.kind === 'region') meshes.push(o); }}));
+  const hit = ray.intersectObjects(meshes)[0];
+  const hitId = hit ? hit.object.userData.regionId : null;
+  selectedRegionId = (hitId && hitId !== selectedRegionId) ? hitId : null;
+  updateLinkEmphasis();
+}}
+
 applyVisibility();
+updateLinkEmphasis();
 (function animate() {{
   requestAnimationFrame(animate);
   renderer.render(scene, camera);
@@ -394,6 +543,111 @@ applyVisibility();
 </script>
 </body>
 </html>"""
+
+
+def _proposed_group_regions(
+    G: nx.Graph,
+    plan: dict[str, Any],
+    class_discs: dict[str, tuple[float, float, float]],
+    cluster_positions: dict[str, dict[str, float]],
+    floors: dict[str, int],
+) -> list[dict[str, Any]]:
+    """The "after" half of the before/after comparison: one region per
+    RECOMMENDED split's proposed group (`risk.recommendation == "split"`
+    only — same gate `build_augmented_graph` uses, a discouraged candidate
+    already has its answer as a number and gets nothing extra drawn), each
+    placed on ITS OWN dominant floor rather than the original class's.
+
+    This is the entire point of a floor view for decouple: `risk_before`'s
+    cross-floor term (see `data_floor.cross_floor_risk`) says a class
+    scores worse for straddling several floors, but a number alone doesn't
+    show whether the PROPOSED split actually fixes that — a community-based
+    grouping optimizes for coupling, not floor-coherence, so a "recommended"
+    split could still straddle just as many floors post-split. Showing each
+    new group on its own real floor makes that visible instead of assumed.
+
+    The floor numbers (`floor`/`min_floor`/`max_floor`/`spans`) are READ
+    from `g["floor_profile"]` — attached once, by `decouple_plan`, and also
+    what `split_risk_score` scores against (see that function's docstring)
+    — never recomputed here. `graphify decouple --3d` visualizes the plan
+    decouple_plan already built; it does not run its own floor analysis. A
+    group with no `floor_profile` (no boundary reachable, or none of its
+    members had a determinable floor) is skipped, same as decouple_plan's
+    own skip — omitted, not defaulted to floor 0.
+
+    Positioned in a small ring around the ORIGINAL class's own disc anchor
+    (not `_class_cluster_layout`'s packing — these are hypothetical nodes
+    it never saw), radius scaled to the number of sibling groups so they
+    fan out rather than stack on one point. Members inside each proposed
+    disc get a FRESH organic scatter (`_stable_unit_pair`, the same
+    function `_class_cluster_layout` uses for real classes) computed
+    around the NEW group center — not their old (x, y) from the original
+    class's disc, which would put them outside the new, smaller disc
+    entirely and made the "after" state look regular/clipped rather than
+    matching the "before" state's own organic-scatter style.
+    """
+    import math
+
+    from graphify.decouple import _class_disc_radius, _stable_unit_pair
+
+    regions: list[dict[str, Any]] = []
+    member_to_region: dict[str, str] = {}
+    for entry in plan.get("god_nodes", []):
+        if entry.get("classification") != "god_object":
+            continue
+        risk = entry.get("risk", {})
+        if risk.get("recommendation") != "split":
+            continue
+        god_id = entry["id"]
+        orig_disc = class_discs.get(god_id)
+        if orig_disc is None:
+            continue
+        ax, ay, aradius = orig_disc
+        non_residual = [g for g in entry.get("proposed_groups", []) if g.get("community_id") is not None]
+        n = len(non_residual)
+        if n == 0:
+            continue
+        for gi, g in enumerate(non_residual):
+            fp = g.get("floor_profile")
+            if fp is None:
+                continue  # decouple_plan couldn't determine this group's floor — omitted, not defaulted
+            members = g.get("members", [])
+
+            angle = 2 * math.pi * gi / n
+            gx = ax + aradius * 0.7 * math.cos(angle)
+            gy = ay + aradius * 0.7 * math.sin(angle)
+            gradius = _class_disc_radius(len(members))
+            region_id = f"_proposed3d_{god_id}_{gi}"
+
+            member_points = []
+            for m in members:
+                if m not in G.nodes or m not in floors:
+                    continue
+                angle_unit, radius_unit = _stable_unit_pair(f"{region_id}::{m}")
+                m_angle = angle_unit * 2 * math.pi
+                r = math.sqrt(radius_unit) * gradius * 0.82
+                member_points.append({
+                    "label": str(G.nodes[m].get("label", m)),
+                    "floor": floors[m],
+                    "x": gx + r * math.cos(m_angle), "y": gy + r * math.sin(m_angle),
+                })
+
+            regions.append({
+                "id": region_id,
+                "label": g.get("name", f"Group {gi}"),
+                "x": gx, "y": gy, "r": gradius,
+                "floor": fp["floor"],
+                "min_floor": fp["min_floor"], "max_floor": fp["max_floor"],
+                "spans": fp["floor_span"],
+                "color": "#22c55e",  # same green family as the 2D "proposed split" diamond
+                "member_count": len(members),
+                "members": member_points,
+                "state": "after",
+                "replaces": god_id,
+            })
+            for m in members:
+                member_to_region[m] = region_id
+    return regions, member_to_region
 
 
 def write_decouple_3d_html(
@@ -410,38 +664,61 @@ def write_decouple_3d_html(
     a flat system.
     """
     from graphify.data_floor import compute_floors
-    from graphify.decouple import _class_cluster_layout, member_ids
+    from graphify.decouple import _class_cluster_layout
     from graphify.exporters.base import COMMUNITY_COLORS
 
     floors, _reasons = compute_floors(G)
     if not floors:
         return None
 
-    cluster_positions, class_discs = _class_cluster_layout(G)
+    # region_members is _class_cluster_layout's OWN authoritative membership
+    # per region — used as-is, never re-derived by filtering on
+    # source_file (a class defined in the same file as a module region's
+    # free functions would otherwise get pulled into that region too, even
+    # though its members already belong to, and are positioned by, their
+    # own class's region — this broke exactly that way before the fix).
+    cluster_positions, class_discs, region_members = _class_cluster_layout(G)
     if not class_discs:
         return None
 
-    region_members: dict[str, list[str]] = {}
-    for region_id in class_discs:
-        if region_id.startswith("_module::"):
-            source_file = region_id[len("_module::"):]
-            region_members[region_id] = [
-                nid for nid in cluster_positions
-                if G.nodes.get(nid, {}).get("source_file") == source_file
-            ]
-        else:
-            region_members[region_id] = member_ids(G, region_id)
+    payload = build_floor_scene(G, class_discs, cluster_positions, region_members, floors, COMMUNITY_COLORS)
+    for r in payload["regions"]:
+        r["state"] = "before"
+    node_region_before = payload.pop("_node_region")
 
-    payload = build_floor_scene(G, class_discs, region_members, floors, COMMUNITY_COLORS)
-    n_span = sum(1 for r in payload["regions"] if r["spans"] > 0)
+    after_regions, member_to_after_region = _proposed_group_regions(G, plan, class_discs, cluster_positions, floors)
+    payload["regions"].extend(after_regions)
+    if after_regions:
+        payload["floors"] = sorted(set(payload["floors"]) | {r["floor"] for r in after_regions})
+
+    # "After" links: the SAME edges, the SAME aggregation
+    # (_aggregate_region_links), but every extracted member now resolves to
+    # its proposed group instead of the class it came from — otherwise
+    # toggling "Preview decoupled view" moved the DISCS but left the wires
+    # drawn as if nothing had been extracted, which is exactly what made the
+    # split's actual coupling shape invisible in the toggle before this.
+    if after_regions:
+        node_region_after = dict(node_region_before)
+        node_region_after.update(member_to_after_region)
+        replaced_ids = {r["replaces"] for r in after_regions}
+        all_ids = {r["id"] for r in payload["regions"]}
+        valid_after_ids = all_ids - replaced_ids
+        payload["links_after"] = _aggregate_region_links(G, node_region_after, valid_after_ids)
+    else:
+        payload["links_after"] = payload["links"]
+
+    n_span = sum(1 for r in payload["regions"] if r["state"] == "before" and r["spans"] > 0)
+    n_proposed = len(after_regions)
     stats = (
-        f"{len(payload['regions'])} units across {len(payload['floors'])} floors; "
+        f"{len(payload['regions']) - n_proposed} units across {len(payload['floors'])} floors; "
         f"{n_span} span more than one"
+        + (f"; {n_proposed} proposed split groups available in \"Preview decoupled view\"" if n_proposed else "")
     )
     html = _page(
         json.dumps(payload).replace("</", "<\\/"),
         _html.escape(str(output_path)),
         _html.escape(stats),
+        bool(after_regions),
     )
     Path(output_path).write_text(html, encoding="utf-8")
     return Path(output_path)

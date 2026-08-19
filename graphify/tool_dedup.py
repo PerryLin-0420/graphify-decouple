@@ -738,6 +738,21 @@ def render_markdown(report: dict[str, Any]) -> str:
                 cand_str = ", ".join(f"`{c['container']}` ({c['source_file']})" for c in mt["candidates"])
                 lines.append(f"  ambiguous existing candidates ruled out: {cand_str}")
         lines.append(f"  _{mt['rationale']}_")
+        cr = cluster.get("consolidation_risk")
+        if cr:
+            lines.append(
+                f"- consolidation_benefit={cr['consolidation_benefit']} "
+                f"consolidation_risk={cr['consolidation_risk']} "
+                f"net_benefit={cr['net_benefit']} -> **{cr['recommendation']}**"
+            )
+            floor_note = (
+                f"floor_span={cr['floor_span']}" if cr["floor_span_known"]
+                else "floor_span=unknown (no I/O boundary reachable)"
+            )
+            lines.append(
+                f"  afferent_total={cr['afferent_total']} {floor_note} "
+                f"— independent of any split's risk_before/risk_after (different question, different scale)"
+            )
         lines.append("")
     lines.append("## Honesty notes")
     for c in report["caveats"]:

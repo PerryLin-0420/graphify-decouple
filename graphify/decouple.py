@@ -371,6 +371,9 @@ _SPLIT_GROUP_CAP = 5           # new classes - 1 >= this maxes the "group overhe
 _STATE_OVERLAP_ADD_WEIGHT = 0.6  # extra risk points ADDED (not blended) at 100% state overlap
 _CROSS_FLOOR_ADD_WEIGHT = 0.35   # fraction of data_floor.cross_floor_risk ADDED to the
                                  # CURRENT-risk score — see original_risk_score
+_GROUP_FLOOR_ADD_WEIGHT = 0.3    # fraction of the worst PROPOSED GROUP's own
+                                 # cross_floor_risk ADDED to split_risk_score — see
+                                 # that function's docstring
 _ACYCLIC_EDGE_DISCOUNT = 0.5   # halves the cross-group-edge component when proposed groups'
                                # dependencies form a DAG (delegating/pipeline) instead of a
                                # cycle — see split_risk_score's "group_dependency_shape"
@@ -493,6 +496,23 @@ def split_risk_score(
       methods, didn't reduce the coupling" failure mode. Also NOT discounted
       by `group_dependency_shape`: shared instance state is a cost whether
       the calls between the groups are one-way or mutual.
+    - `max_group_floor_risk` (only when a group in `groups` carries a
+      `floor_profile` — attached by `decouple_plan`, see
+      `graphify.data_floor`, BEFORE this function is called; this function
+      never computes floors itself): the worst
+      `data_floor.cross_floor_risk` among the proposed groups' OWN member
+      floors. A split grouped by community/coupling optimizes for a
+      DIFFERENT axis than floor-coherence — a "recommended" split can
+      still leave one or more resulting groups straddling the same several
+      data-flow stages the original class did. This is ADDITIVE, same
+      reasoning as the state-overlap term: crossing floors is bad news
+      independent of how clean the call-graph shape looks, so a second bad
+      signal must only ever reveal MORE risk. It does not veto a split —
+      the weight (`_GROUP_FLOOR_ADD_WEIGHT`) is deliberately a fraction,
+      not the whole 100, so a split can still net-benefit despite some
+      residual floor-crossing if the coupling reduction is large enough.
+      Absent (skipped) when no proposed group has a determinable floor —
+      an unknown, never scored as if verified floor-coherent.
 
     A single non-residual group (nothing left to compare against) has no
     split risk by construction — there is no second class to be coupled to.
@@ -511,6 +531,8 @@ def split_risk_score(
             "state_analysis": "n/a (nothing to compare)",
             "max_state_overlap": None,
             "state_overlap_pairs": [],
+            "group_floor_analysis": "n/a (nothing to compare)",
+            "max_group_floor_risk": None,
             "score": 0.0,
         }
 
@@ -557,6 +579,8 @@ def split_risk_score(
     # keeps the two signals independent instead of one diluting the other.
     call_graph_score = 100 * (0.45 * edge_component + 0.40 * straddle_component + 0.15 * group_overhead)
 
+    score = call_graph_score
+
     if state_overlap is not None:
         state_component = state_overlap.get("max_overlap") or 0.0
         # ADDITIVE, not blended into the weighted average above: state
@@ -566,11 +590,25 @@ def split_risk_score(
         # get pulled DOWN by a merely-moderate state overlap — the opposite
         # of what a second bad signal should do. Adding it on top (capped at
         # 100) means the state check can only reveal MORE risk, never less.
-        score = round(min(100.0, call_graph_score + _STATE_OVERLAP_ADD_WEIGHT * 100 * state_component), 1)
+        score = min(100.0, score + _STATE_OVERLAP_ADD_WEIGHT * 100 * state_component)
         state_analysis = "ok"
     else:
-        score = round(call_graph_score, 1)
         state_analysis = "skipped (no project_root given, unsupported language, or source unreadable)"
+
+    # group_floor_profile is attached by decouple_plan (graphify.data_floor),
+    # BEFORE this function runs — never recomputed here. A group missing it
+    # (no boundary reachable, or no member had a determinable floor) is
+    # simply absent from `group_profiles`, not treated as floor-coherent.
+    from graphify.data_floor import cross_floor_risk as _cross_floor_risk
+
+    group_profiles = [g["floor_profile"] for g in non_residual if g.get("floor_profile")]
+    if group_profiles:
+        max_group_floor_risk = max(_cross_floor_risk(p) for p in group_profiles)
+        score = min(100.0, score + _GROUP_FLOOR_ADD_WEIGHT * max_group_floor_risk)
+        group_floor_analysis = "ok"
+    else:
+        max_group_floor_risk = None
+        group_floor_analysis = "skipped (no I/O boundary reachable, or no proposed group had a determinable floor)"
 
     return {
         "n_new_classes": len(non_residual),
@@ -581,7 +619,9 @@ def split_risk_score(
         "state_analysis": state_analysis,
         "max_state_overlap": state_overlap.get("max_overlap") if state_overlap else None,
         "state_overlap_pairs": state_overlap.get("pairs", []) if state_overlap else [],
-        "score": score,
+        "group_floor_analysis": group_floor_analysis,
+        "max_group_floor_risk": max_group_floor_risk,
+        "score": round(score, 1),
     }
 
 
@@ -752,6 +792,17 @@ def decouple_plan(
                 G, info["members"], communities, community_labels,
                 min_group_size=min_group_size,
             )
+            # Each non-residual group's OWN floor profile, attached HERE —
+            # the single place it is computed. split_risk_score reads it
+            # (never recomputes it) to score whether the split actually
+            # resolves cross-floor spread; render_markdown/decouple.json
+            # carry it for reporting; decouple_3d.py reads the SAME
+            # attached value again for its before/after view — nothing
+            # downstream of decouple_plan recomputes floors from scratch.
+            if floors:
+                for g in groups:
+                    if g["community_id"] is not None:
+                        g["floor_profile"] = class_floor_profile(G, None, g["members"], floors)
             info["proposed_groups"] = groups
             risk_before = original_risk_score(info)
             non_residual = [gr for gr in groups if gr["community_id"] is not None]
@@ -842,6 +893,17 @@ def decouple_plan(
             "floor_profile was NOT measured (no boundary reachable), which "
             "is not the same as sitting on a single floor — its "
             "risk_before carries no cross-floor term either way.",
+            "Each proposed group ALSO gets its own floor_profile (attached "
+            "once, here, and read — never recomputed — by split_risk_score "
+            "and by decouple_3d.py's before/after view). max_group_floor_risk "
+            "in a split's detail is the worst one, added into that split's "
+            "score at a fraction (_GROUP_FLOOR_ADD_WEIGHT) of full weight — "
+            "grouping by community/coupling optimizes for a DIFFERENT axis "
+            "than floor-coherence, so a 'recommended' split is not "
+            "guaranteed to leave every resulting group on a single floor; "
+            "this makes that visible in the number instead of assumed. It "
+            "is a weighted cost, not a veto — a split can still net-benefit "
+            "despite some residual floor-crossing.",
         ],
     }
 
@@ -915,7 +977,7 @@ def _pack_discs(sizes: list[tuple[str, float]]) -> dict[str, tuple[float, float]
 
 def _class_cluster_layout(
     G: nx.DiGraph,
-) -> "tuple[dict[str, dict[str, float]], dict[str, tuple[float, float, float]]]":
+) -> "tuple[dict[str, dict[str, float]], dict[str, tuple[float, float, float]], dict[str, list[str]]]":
     """Fixed (x, y) positions for EVERY class in the graph and its own
     members, laid out so class regions never overlap each other.
 
@@ -951,14 +1013,21 @@ def _class_cluster_layout(
     source file of their own (`numpy.ndarray` and friends): they declare
     that something exists elsewhere, they are not code living in this unit.
 
-    Returns `(positions, discs)` — `discs` maps each region's key (a class
-    node id, or a `_module::<path>` synthetic key) to its
+    Returns `(positions, discs, region_members)`. `discs` maps each region's
+    key (a class node id, or a `_module::<path>` synthetic key) to its
     `(center_x, center_y, radius)`. The renderer draws THAT circle rather
     than fitting an ellipse to the member positions: the disc is the exact
     region `_pack_discs` proved non-overlapping, whereas a fitted ellipse
     has to be padded outward to cover every member and can then cross into
     a neighbor (measured on a real corpus: 7 overlapping pairs from fitting
-    alone, on a layout whose discs were provably disjoint).
+    alone, on a layout whose discs were provably disjoint). `region_members`
+    is the AUTHORITATIVE membership for each key — callers must use it
+    rather than re-deriving "who's in this module region" from source_file
+    (an earlier version of this code's caller did exactly that, filtering
+    `positions` by `source_file`, and silently pulled in a DIFFERENT class's
+    members whenever a class shared a file with free functions — every node
+    is claimed by exactly ONE region here, so this dict is the single
+    source of truth for it).
     """
     from graphify.analyze import _is_file_node
 
@@ -999,7 +1068,7 @@ def _class_cluster_layout(
         sizes.append((key, _class_disc_radius(len(free_nodes))))
 
     if not sizes:
-        return {}, {}
+        return {}, {}, {}
 
     import math
 
@@ -1048,7 +1117,7 @@ def _class_cluster_layout(
         # spread the discs apart while leaving each region the same small
         # size, which is what made them invisible at corpus scale.
         discs = {k: (cx * scale, cy * scale, r * scale) for k, (cx, cy, r) in discs.items()}
-    return positions, discs
+    return positions, discs, members_by_class
 
 
 def _resolve_function_node(G: nx.DiGraph, source_file: str, name: str) -> "str | None":
@@ -1074,6 +1143,131 @@ def _resolve_class_node(G: nx.DiGraph, container: "str | None", source_file: "st
     if container is None:
         return None
     return _resolve_function_node(G, source_file or "", container)
+
+
+_CONSOLIDATION_AFFERENT_CAP = 40.0    # summed afferent degree across all copies >= this maxes concentration
+_CONSOLIDATION_FLOOR_SPAN_CAP = 3.0   # floor span across resolved copies >= this maxes the cross-floor component
+_CONSOLIDATION_BENEFIT_CAP = 4.0      # (copies - 1) >= this maxes the raw duplication-removed benefit
+_CONSOLIDATION_NET_THRESHOLD = 5.0    # net_benefit must exceed this to recommend consolidating
+
+
+def consolidation_risk_score(
+    G: nx.DiGraph,
+    cluster: dict[str, Any],
+    resolved_ids: list[str],
+    floors: "dict[str, int] | None",
+) -> dict[str, Any]:
+    """Risk/benefit verdict for ONE `tool_dedup` cluster's consolidation —
+    same STYLE as `split_risk_score`/`balance_risk` (named, capped weighted
+    components; an explicit net_benefit verdict), but never compared
+    against a split's numbers or folded into `risk_before`/`risk_after`.
+    A split's net_benefit answers a LOCAL question (is this one class's
+    internal responsibility split worth it); a merge's answers a GLOBAL one
+    (how many far-apart places currently duplicate this logic, and what
+    would depending on one shared place cost). Putting both on one scale
+    would produce a number that looks precise while comparing two
+    different things — see the design discussion this function resolves.
+
+    Benefit: `(copies - 1)` — how many redundant implementations would go
+    away — capped, and scaled by `avg_jaccard` (cluster["avg_jaccard"]):
+    a low-confidence match earns little benefit credit for "removing
+    duplication" it isn't confident is even real duplication.
+
+    Risk, three independent components:
+    - `afferent_total`: summed in-degree across every resolved copy — how
+      many distinct call sites currently depend on ONE OF the copies.
+      After consolidation they all depend on the SAME node — a
+      concentration risk (single point of failure / wider blast radius)
+      that scales with how heavily-used the duplicated logic already is.
+    - `floor_span`: the spread, in `graphify.data_floor` terms, across the
+      resolved copies' floors. Consolidating logic that currently lives at
+      different distances from the I/O boundary pulls the new shared unit
+      across that same span — the same structural risk
+      `data_floor.cross_floor_risk` scores for an existing class, applied
+      here to a proposed one.
+    - `uncertainty`: `1 - avg_jaccard` — structural similarity is a proxy,
+      not semantic equivalence (see `tool_dedup`'s own module docstring);
+      a weaker match is a real correctness risk if merged anyway, not just
+      a weaker signal.
+
+    `floors` may be `None` or incomplete (no I/O boundary detected, or a
+    resolved node outside every reachable component) — the floor
+    component is then 0, not penalized and not silently treated as
+    "verified single-floor"; `state_analysis`-style callers should read
+    `floor_span_known` to tell the two apart.
+    """
+    afferent_total = sum(G.in_degree(nid) for nid in resolved_ids if nid in G.nodes)
+    afferent_component = min(afferent_total / _CONSOLIDATION_AFFERENT_CAP, 1.0)
+
+    known_floors = [floors[nid] for nid in resolved_ids if floors and nid in floors]
+    floor_span = (max(known_floors) - min(known_floors)) if known_floors else 0
+    floor_component = min(floor_span / _CONSOLIDATION_FLOOR_SPAN_CAP, 1.0)
+
+    avg_jaccard = float(cluster.get("avg_jaccard") or 0.0)
+    uncertainty_component = max(0.0, 1.0 - avg_jaccard)
+
+    risk = round(100 * (
+        0.45 * afferent_component
+        + 0.30 * floor_component
+        + 0.25 * uncertainty_component
+    ), 1)
+
+    n_copies = len(cluster.get("members", []))
+    raw_benefit = min(max(n_copies - 1, 0) / _CONSOLIDATION_BENEFIT_CAP, 1.0)
+    benefit = round(100 * raw_benefit * avg_jaccard, 1)
+
+    net_benefit = round(benefit - risk, 1)
+    if net_benefit > _CONSOLIDATION_NET_THRESHOLD:
+        recommendation = "consolidate"
+    elif net_benefit < -_CONSOLIDATION_NET_THRESHOLD:
+        recommendation = "keep_separate"
+    else:
+        recommendation = "marginal"
+
+    return {
+        "consolidation_benefit": benefit,
+        "consolidation_risk": risk,
+        "net_benefit": net_benefit,
+        "recommendation": recommendation,
+        "afferent_total": afferent_total,
+        "floor_span": floor_span,
+        "floor_span_known": bool(known_floors),
+        "avg_jaccard": avg_jaccard,
+    }
+
+
+def annotate_consolidation_risk(
+    G: nx.DiGraph,
+    report: dict[str, Any],
+    floors: "dict[str, int] | None" = None,
+) -> dict[str, Any]:
+    """Attach a `consolidation_risk` verdict (see `consolidation_risk_score`)
+    to every cluster in a `tool_dedup.find_duplicate_function_clusters`
+    report, IN PLACE, and return it. A cluster where fewer than 2 members
+    resolve to real graph nodes is left un-annotated (`consolidation_risk`
+    absent) — the same under-report-don't-guess rule
+    `overlay_tool_dedup_clusters` applies, so a report rendered before vs.
+    after this call never disagrees about which clusters are actionable.
+
+    Deliberately separate from `overlay_tool_dedup_clusters`: that function
+    builds a VISUALIZATION (needs the plan's proposed nodes to already
+    exist); this one only needs the report and the graph, so it can run
+    before `render_markdown`/`decouple.json` are written — the CLI calls it
+    first, so the risk verdict is already there when the report renders,
+    not only on the graph the HTML view builds afterward.
+    """
+    for cluster in report.get("clusters", []):
+        resolved_ids = [
+            nid for nid in (
+                _resolve_function_node(G, m["source_file"], m["name"])
+                for m in cluster["members"]
+            )
+            if nid is not None
+        ]
+        if len(resolved_ids) < 2:
+            continue
+        cluster["consolidation_risk"] = consolidation_risk_score(G, cluster, resolved_ids, floors)
+    return report
 
 
 def overlay_tool_dedup_clusters(
@@ -1257,7 +1451,7 @@ def build_augmented_graph(
     # what actually fixes nodes to these coordinates in the browser;
     # unchecking it lets physics take back over. Stamping happens
     # regardless of that toggle's default so the data is there either way.
-    cluster_positions, class_discs = _class_cluster_layout(G)
+    cluster_positions, class_discs, region_members = _class_cluster_layout(G)
     for nid, pos in cluster_positions.items():
         if nid in G2.nodes:
             G2.nodes[nid]["cluster_x"] = pos["x"]
@@ -1279,12 +1473,15 @@ def build_augmented_graph(
         if region_id.startswith("_module::"):
             # A module region groups the free functions of one file — same
             # kind of "this is one unit" statement as a class region, drawn
-            # identically, labeled by the file it came from.
+            # identically, labeled by the file it came from. Membership
+            # comes from region_members (the layout's own authoritative
+            # list), NOT re-derived by filtering on source_file — a class
+            # defined in the SAME file as free functions would otherwise
+            # get pulled into this region too, even though its members
+            # already belong to (and are correctly positioned by) their
+            # own class's region.
             source_file = region_id[len("_module::"):]
-            region_nodes = [
-                nid for nid in cluster_positions
-                if G.nodes.get(nid, {}).get("source_file") == source_file
-            ]
+            region_nodes = list(region_members.get(region_id, []))
             label = source_file.rsplit("/", 1)[-1]
         else:
             region_nodes = [region_id] + list(member_ids(G, region_id))
@@ -1501,10 +1698,20 @@ def render_markdown(plan: dict[str, Any]) -> str:
                             lines.append(f"      shared helper calls: {', '.join(pair['shared_calls'][:8])}")
                 else:
                     lines.append(f"  - state-sharing check: {sd.get('state_analysis', 'skipped')}")
+                if sd.get("group_floor_analysis") == "ok":
+                    lines.append(f"  - worst proposed group's own cross-floor risk: {sd['max_group_floor_risk']}")
+                else:
+                    lines.append(f"  - cross-floor check on proposed groups: {sd.get('group_floor_analysis', 'skipped')}")
             for g in entry.get("proposed_groups", []):
                 conf = g.get("cohesion_confidence", "n/a")
                 lines.append("")
                 lines.append(f"### Proposed: {g['name']} ({len(g['members'])} members, confidence={conf})")
+                fp = g.get("floor_profile")
+                if fp:
+                    lines.append(
+                        f"- floor={fp['floor']} (range {fp['min_floor']}-{fp['max_floor']})"
+                        + (f" — still spans {fp['floor_span'] + 1} floors" if fp["floor_span"] else " — single floor")
+                    )
                 for lbl in g["member_labels"]:
                     lines.append(f"- {lbl}")
         elif "hub_suggestion" in entry:
