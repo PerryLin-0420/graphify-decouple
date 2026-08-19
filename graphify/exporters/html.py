@@ -69,44 +69,101 @@ def _html_styles() -> str:
 
 def _hyperedge_script(hyperedges_json: str) -> str:
     return f"""<script>
-// Render hyperedges as shaded regions
+// Render hyperedges as shaded confidence-ellipse-style regions — used both
+// for graphify's own extracted multi-way relations (README-derived feature
+// groups etc., no styling fields set — keeps the original indigo look) and
+// for graphify.decouple's class-boundary hulls (fill/stroke/dashed set
+// explicitly — see decouple._class_hulls), which need a visually distinct,
+// clearly readable style so a class boundary reads as an actual REGION
+// (like a cluster plot's confidence ellipse), not a faint hint.
 const hyperedges = {hyperedges_json};
-// afterDrawing passes ctx already transformed to network coordinate space.
-// Draw node positions raw — no manual pan/zoom/DPR math needed.
-network.on('afterDrawing', function(ctx) {{
+// beforeDrawing (not afterDrawing) so the ellipse paints BEHIND nodes/edges
+// for that frame — node dots and labels stay crisp on top of the fill,
+// matching how a cluster-plot ellipse sits behind its points.
+network.on('beforeDrawing', function(ctx) {{
     hyperedges.forEach(h => {{
+        // No `layer` at all = a pre-existing semantic hyperedge (not from
+        // decouple) — always drawn. A tagged layer is gated by its checkbox.
+        if (h.layer && typeof HULL_LAYERS_VISIBLE !== 'undefined' && !HULL_LAYERS_VISIBLE[h.layer]) return;
+        // Explicit geometry (graphify.decouple's class discs, which were
+        // computed to be provably non-overlapping) wins over fitting a
+        // shape to wherever the nodes currently sit — a fit has to be
+        // padded outward to cover every member, and that padding is what
+        // pushes one class's region into its neighbor's.
+        if (h.cx != null && h.cy != null && h.r != null) {{
+            drawRegion(ctx, h, h.cx, h.cy, h.r, h.r, 0);
+            return;
+        }}
         const positions = h.nodes
             .map(nid => network.getPositions([nid])[nid])
             .filter(p => p !== undefined);
         if (positions.length < 2) return;
-        ctx.save();
-        ctx.globalAlpha = 0.12;
-        ctx.fillStyle = '#6366f1';
-        ctx.strokeStyle = '#6366f1';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        // Centroid and expanded hull in network coordinates
-        const cx = positions.reduce((s, p) => s + p.x, 0) / positions.length;
-        const cy = positions.reduce((s, p) => s + p.y, 0) / positions.length;
-        const expanded = positions.map(p => ({{
-            x: cx + (p.x - cx) * 1.15,
-            y: cy + (p.y - cy) * 1.15
-        }}));
-        ctx.moveTo(expanded[0].x, expanded[0].y);
-        expanded.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
-        ctx.closePath();
-        ctx.fill();
-        ctx.globalAlpha = 0.4;
-        ctx.stroke();
-        // Label
-        ctx.globalAlpha = 0.8;
-        ctx.fillStyle = '#4f46e5';
-        ctx.font = 'bold 11px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText(h.label, cx, cy - 5);
-        ctx.restore();
+        const n = positions.length;
+        const cx = positions.reduce((s, p) => s + p.x, 0) / n;
+        const cy = positions.reduce((s, p) => s + p.y, 0) / n;
+        // Covariance-matrix ellipse: orient along the point scatter's own
+        // principal axes (closed-form 2x2 eigendecomposition) instead of a
+        // polygon connecting literal node positions — a smooth region that
+        // reads as "this is a group", not a jagged shape that changes
+        // silhouette every time physics nudges one outlier node.
+        let varX = 0, varY = 0, covXY = 0;
+        positions.forEach(p => {{
+            const dx = p.x - cx, dy = p.y - cy;
+            varX += dx * dx; varY += dy * dy; covXY += dx * dy;
+        }});
+        varX /= n; varY /= n; covXY /= n;
+        const trace = varX + varY, det = varX * varY - covXY * covXY;
+        const disc = Math.max(trace * trace / 4 - det, 0);
+        const lambda1 = trace / 2 + Math.sqrt(disc);
+        const lambda2 = Math.max(trace / 2 - Math.sqrt(disc), 0);
+        const angle = Math.abs(covXY) < 1e-9 && Math.abs(varX - varY) < 1e-9
+            ? 0 : 0.5 * Math.atan2(2 * covXY, varX - varY);
+        let semiMajor = Math.sqrt(lambda1) || 1;
+        let semiMinor = Math.max(Math.sqrt(lambda2), semiMajor * 0.3) || 1;
+        // Scale up until every member node is strictly inside the ellipse —
+        // a covariance ellipse is a statistical fit, not a guaranteed
+        // cover; a member drawn OUTSIDE its own class's boundary would be
+        // actively misleading here.
+        const cosA = Math.cos(-angle), sinA = Math.sin(-angle);
+        let k = 1;
+        positions.forEach(p => {{
+            const dx = p.x - cx, dy = p.y - cy;
+            const lx = dx * cosA - dy * sinA, ly = dx * sinA + dy * cosA;
+            const ratio = Math.sqrt((lx / semiMajor) ** 2 + (ly / semiMinor) ** 2);
+            if (ratio > k) k = ratio;
+        }});
+        const pad = 1.2;
+        const rx = Math.max(semiMajor * k * pad, 45);
+        const ry = Math.max(semiMinor * k * pad, 45);
+        drawRegion(ctx, h, cx, cy, rx, ry, angle);
     }});
 }});
+
+function drawRegion(ctx, h, cx, cy, rx, ry, angle) {{
+    ctx.save();
+    const fill = h.fill || '#6366f1';
+    const stroke = h.stroke || fill;
+    ctx.fillStyle = fill;
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 2.5;
+    if (h.dashed) ctx.setLineDash([8, 5]);
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rx, ry, angle, 0, 2 * Math.PI);
+    ctx.closePath();
+    ctx.globalAlpha = h.fillAlpha != null ? h.fillAlpha : 0.22;
+    ctx.fill();
+    ctx.globalAlpha = h.strokeAlpha != null ? h.strokeAlpha : 0.75;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Label above the region's top edge (not at dead center, where it would
+    // sit under overlapping node dots).
+    ctx.globalAlpha = 0.95;
+    ctx.fillStyle = h.labelColor || '#4f46e5';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(h.label, cx, cy - ry - 8);
+    ctx.restore();
+}}
 </script>"""
 
 def _html_script(nodes_json: str, edges_json: str, legend_json: str) -> str:
@@ -131,6 +188,8 @@ const nodesDS = new vis.DataSet(RAW_NODES.map(n => {{
     _label_plain: n.label, _label_scored: n.label_scored || n.label,
     _extracted_into: n.extracted_into || null,
     _state_overlaps: n.state_overlaps || null,
+    _cluster_x: n.cluster_x != null ? n.cluster_x : null,
+    _cluster_y: n.cluster_y != null ? n.cluster_y : null,
   }};
   // Conditional keys only — an explicit `undefined` on a vis.DataSet item can
   // still override the network-wide default (e.g. shape: 'dot'), so these are
@@ -140,6 +199,13 @@ const nodesDS = new vis.DataSet(RAW_NODES.map(n => {{
   if (n.shape) base.shape = n.shape;
   if (n.borderWidth) base.borderWidth = n.borderWidth;
   if (n.shapeProperties) base.shapeProperties = n.shapeProperties;
+  // "Class boundaries" defaults ON — apply the cluster-plot position from
+  // the very first frame (not as a post-creation reposition) so the graph
+  // never flashes an un-clustered layout before the toggle catches up.
+  if (n.cluster_x != null && n.cluster_y != null) {{
+    base.x = n.cluster_x; base.y = n.cluster_y;
+    base.fixed = {{ x: true, y: true }};
+  }}
   if (n.hidden) base.hidden = true;
   return base;
 }}));
@@ -236,6 +302,30 @@ function setScoreMode(showScores) {{
     .filter(n => n.label_scored && n.label_scored !== n.label)
     .map(n => ({{ id: n.id, label: showScores ? n.label_scored : n.label }}));
   if (updates.length) nodesDS.update(updates);
+}}
+
+// Whether decouple's class-boundary regions are drawn. A hull with no
+// `layer` at all (a pre-existing semantic hyperedge, not from decouple) is
+// ALWAYS drawn, regardless of this map. Background regions mean exactly one
+// thing — "this is one class" — so `class` is the only gated layer; a
+// proposed split or merge is a CHANGE to the code and is drawn as wiring
+// (◆ nodes + proposed edges under "Preview decoupled view") instead.
+let HULL_LAYERS_VISIBLE = {{ class: true }};
+
+// Toggling class boundaries also toggles the non-overlapping class layout
+// they are drawn over (see graphify.decouple._class_cluster_layout) —
+// the regions only make sense at those positions; over raw physics
+// positions two classes' methods interleave and the regions collide.
+function setClassBoundaryLayout(enabled) {{
+  HULL_LAYERS_VISIBLE.class = enabled;
+  const updates = RAW_NODES
+    .filter(n => n.cluster_x != null && n.cluster_y != null)
+    .map(n => enabled
+      ? {{ id: n.id, x: n.cluster_x, y: n.cluster_y, fixed: {{ x: true, y: true }} }}
+      : {{ id: n.id, fixed: {{ x: false, y: false }} }});
+  if (updates.length) nodesDS.update(updates);
+  if (enabled) network.stabilize(); else network.startSimulation();
+  network.redraw();
 }}
 
 function focusNode(nodeId) {{
@@ -479,6 +569,7 @@ def to_html(
     # never drawn here, so there is only one color to pick).
     _DECOUPLE_RING_COLOR = "#22c55e"
     has_proposed = any(data.get("kind") == "proposed" for _, data in G.nodes(data=True))
+    hull_layers = {h.get("layer") for h in getattr(G, "graph", {}).get("hyperedges", []) if h.get("layer")}
 
     # Build nodes list for vis.js
     vis_nodes = []
@@ -515,6 +606,15 @@ def to_html(
         extracted_into = data.get("decouple_extracted_into")
         if extracted_into:
             node["extracted_into"] = extracted_into
+        # Non-overlapping cluster-plot coordinates (see
+        # graphify.decouple._class_cluster_layout) — present only for nodes
+        # belonging to an analyzed class. The "Class boundaries" toggle
+        # fixes a node here; unchecking it releases the node back to
+        # physics. Absent entirely for a plain graph.html (no decouple
+        # plan involved), so that render is untouched.
+        if "cluster_x" in data and "cluster_y" in data:
+            node["cluster_x"] = data["cluster_x"]
+            node["cluster_y"] = data["cluster_y"]
         # Conditional learning fields — only present for annotated nodes, so
         # un-annotated output keeps the exact pre-feature node dict shape.
         entry = learning_overlay.get(str(node_id)) if learning_overlay else None
@@ -596,20 +696,31 @@ def to_html(
     vis_edges = []
     for u, v, data in G.edges(data=True):
         if data.get("kind") == "proposed_edge":
-            # god node -> proposed group, always a RECOMMENDED split (see
-            # build_augmented_graph) — colored to match the diamond it points
-            # at, so the edge and the node read as one unit regardless of
-            # confidence styling. _src/_tgt (not u/v) for the same reason as
-            # the generic path below: an undirected graph canonicalizes edge
-            # endpoint order.
+            # A proposed CHANGE, in one of two opposite directions — pulling
+            # a group OUT of a god node (build_augmented_graph, green, the
+            # same color as the ◆ it points at so edge and node read as one
+            # unit) or folding scattered duplicates IN to a shared home
+            # (overlay_tool_dedup_clusters, blue). Both are `proposed_edge`;
+            # keying the label/color off `decouple_recommendation` is what
+            # keeps a consolidation from being drawn — and labeled — as if
+            # it were an extraction. _src/_tgt (not u/v) for the same reason
+            # as the generic path below: an undirected graph canonicalizes
+            # edge endpoint order.
+            is_merge = data.get("decouple_recommendation") == "merge"
             vis_edges.append({
                 "from": data.get("_src", u),
                 "to": data.get("_tgt", v),
-                "label": "extract",
-                "title": _html.escape("decouple: recommended split"),
+                "label": "merge_candidate" if is_merge else "extract",
+                "title": _html.escape(
+                    "decouple: consolidation candidate" if is_merge
+                    else "decouple: recommended split"
+                ),
                 "dashes": True,
                 "width": 2,
-                "color": {"color": _DECOUPLE_RING_COLOR, "opacity": 0.85},
+                "color": {
+                    "color": "#3b82f6" if is_merge else _DECOUPLE_RING_COLOR,
+                    "opacity": 0.85,
+                },
             })
             continue
         if data.get("kind") == "redirected_edge":
@@ -691,6 +802,17 @@ def to_html(
         'onchange="setScoreMode(this.checked)">Show risk scores</label>'
         if has_proposed else ""
     )
+    # Class-boundary checkbox: only when class hulls are actually present (a
+    # plain graph.html — no decouple plan involved at all — renders none).
+    # Defaults CHECKED: unlike a proposal overlay, a class boundary is a
+    # fact about the code, and the non-overlapping layout it implies is the
+    # readable default (see decouple._class_cluster_layout).
+    hull_controls_html = (
+        '<label><input type="checkbox" id="hull-class-cb" checked '
+        'onchange="setClassBoundaryLayout(this.checked)">Class boundaries '
+        '<span style="color:#666">(non-overlapping layout)</span></label>'
+        if "class" in hull_layers else ""
+    )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -718,6 +840,7 @@ def to_html(
     <div id="legend-controls">
       <label><input type="checkbox" id="select-all-cb" checked onchange="toggleAllCommunities(!this.checked)">Select All</label>
       {decouple_controls_html}
+      {hull_controls_html}
     </div>
     <div id="legend"></div>
   </div>

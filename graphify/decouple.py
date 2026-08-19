@@ -369,6 +369,8 @@ _RISK_FRAGMENTATION_CAP = 5    # distinct_member_communities >= this maxes "frag
 _SPLIT_EDGE_CAP = 10           # new cross-group edges >= this maxes the "new coupling" component
 _SPLIT_GROUP_CAP = 5           # new classes - 1 >= this maxes the "group overhead" component
 _STATE_OVERLAP_ADD_WEIGHT = 0.6  # extra risk points ADDED (not blended) at 100% state overlap
+_CROSS_FLOOR_ADD_WEIGHT = 0.35   # fraction of data_floor.cross_floor_risk ADDED to the
+                                 # CURRENT-risk score — see original_risk_score
 _ACYCLIC_EDGE_DISCOUNT = 0.5   # halves the cross-group-edge component when proposed groups'
                                # dependencies form a DAG (delegating/pipeline) instead of a
                                # cycle — see split_risk_score's "group_dependency_shape"
@@ -376,15 +378,33 @@ _ACYCLIC_EDGE_DISCOUNT = 0.5   # halves the cross-group-edge component when prop
 
 def original_risk_score(entry: dict[str, Any]) -> float:
     """0-100 proxy for the god node's CURRENT risk: how much is bundled
-    together (size), how coupled it already is (afferent+efferent), and how
-    many distinct responsibilities are mixed in (fragmentation).
+    together (size), how coupled it already is (afferent+efferent), how
+    many distinct responsibilities are mixed in (fragmentation), and how
+    far it straddles the system's data flow (`floor_span`, when a floor
+    profile is available — see `graphify.data_floor`).
+
+    The cross-floor term is ADDITIVE, capped at 100, rather than being
+    blended into the weighted average: straddling the data flow is an
+    INDEPENDENT reason a class is risky, orthogonal to how big or coupled
+    it is (a small, loosely-coupled class that both reads files and renders
+    UI is genuinely mixed-responsibility, and averaging that signal against
+    a low size score would hide it). Same direction as
+    `split_risk_score`'s state-overlap term, for the same reason: a second
+    bad signal must only ever reveal MORE risk, never less.
+
+    A node with no floor profile (`floor_risk` absent, e.g. no I/O boundary
+    detected anywhere in the graph) simply omits the term — unknown is not
+    scored as clean, it is scored as "this component wasn't measured", and
+    the report says which.
 
     Weights/caps are a fixed heuristic, not a validated complexity metric —
     useful to compare candidates on THIS graph, not as an absolute score."""
     size = min(entry["member_count"] / _RISK_SIZE_CAP, 1.0)
     coupling = min((entry["afferent"] + entry["efferent"]) / _RISK_COUPLING_CAP, 1.0)
     fragmentation = min(entry["distinct_member_communities"] / _RISK_FRAGMENTATION_CAP, 1.0)
-    return round(100 * (0.40 * size + 0.35 * coupling + 0.25 * fragmentation), 1)
+    base = 100 * (0.40 * size + 0.35 * coupling + 0.25 * fragmentation)
+    floor_risk = entry.get("floor_risk") or 0.0
+    return round(min(100.0, base + _CROSS_FLOOR_ADD_WEIGHT * floor_risk), 1)
 
 
 def _group_state_overlap(
@@ -482,7 +502,10 @@ def split_risk_score(
         return {
             "n_new_classes": len(non_residual),
             "cross_group_edges": 0,
-            "group_dependency_shape": "n/a (nothing to compare)",
+            "group_dependency_shape": "n/a",  # embedded inline in render_markdown's
+                                               # parenthetical — the longer "nothing to
+                                               # compare" phrasing already appears on
+                                               # its own line via state_analysis below.
             "straddling_callers": 0,
             "straddling_caller_labels": [],
             "state_analysis": "n/a (nothing to compare)",
@@ -698,6 +721,14 @@ def decouple_plan(
     """
     from graphify.analyze import god_nodes as _god_nodes
 
+    from graphify.data_floor import class_floor_profile, compute_floors, cross_floor_risk
+
+    # Data-flow floors for the whole graph, computed once (BFS from the I/O
+    # boundary — see graphify.data_floor). Empty when no boundary is
+    # detectable at all, in which case every entry's floor fields stay
+    # absent rather than defaulting to a fabricated layer.
+    floors, floor_reasons = compute_floors(G)
+
     gods = _god_nodes(G, top_n=top_n)
     entries: list[dict[str, Any]] = []
     for g in gods:
@@ -709,6 +740,13 @@ def decouple_plan(
             min_communities_for_split=min_communities_for_split,
             project_root=project_root,
         )
+        floor_profile = class_floor_profile(G, node_id, info["members"], floors) if floors else None
+        if floor_profile:
+            info["floor_profile"] = floor_profile
+            # Consumed by original_risk_score as an additive term — a class
+            # straddling several data-flow stages is risky in a way the
+            # call-graph metrics cannot see.
+            info["floor_risk"] = cross_floor_risk(floor_profile)
         if info["classification"] == "god_object":
             groups = candidate_groups(
                 G, info["members"], communities, community_labels,
@@ -793,8 +831,355 @@ def decouple_plan(
             "pipeline' judgment, and a 2-group split is weak evidence either "
             "way; straddling_callers and max_state_overlap are NOT discounted "
             "by it.",
+            "floor_profile / floor_risk come from graphify.data_floor: BFS "
+            "distance from the system's I/O boundary, where the boundary is "
+            "detected by a NAME heuristic (path tokens + symbol-name stems), "
+            "not by actual I/O analysis — it can miss a boundary hidden "
+            "behind a domain-flavored name and can flag a parse_args() that "
+            "never touches the outside world. Distance is measured on the "
+            "UNDIRECTED graph: a call edge's direction is who-invokes-whom, "
+            "which is not the same as which way data moves. A class with no "
+            "floor_profile was NOT measured (no boundary reachable), which "
+            "is not the same as sitting on a single floor — its "
+            "risk_before carries no cross-floor term either way.",
         ],
     }
+
+
+def _stable_unit_pair(seed: str) -> tuple[float, float]:
+    """Two stable floats in [0, 1) derived from `seed` — a deterministic
+    stand-in for `random.random()`. Used to scatter a class's members inside
+    its own disc without them landing on a visibly regular ring; the point
+    is an organic-looking spread, not statistical quality, but it MUST be
+    reproducible (the same graph.json has to render identically every time,
+    matching the rest of decouple's 0-LLM/deterministic contract)."""
+    import hashlib
+
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    a = int.from_bytes(digest[0:4], "big") / 2**32
+    b = int.from_bytes(digest[4:8], "big") / 2**32
+    return a, b
+
+
+def _class_disc_radius(member_count: int) -> float:
+    """Radius of the disc a class's own node + members are scattered into.
+    Grows with sqrt(members) so AREA grows linearly with member count —
+    node density inside a large class's disc stays comparable to a small
+    one's instead of the big classes becoming solid blobs."""
+    import math
+
+    return 70.0 + 42.0 * math.sqrt(max(member_count, 1))
+
+
+def _pack_discs(sizes: list[tuple[str, float]]) -> dict[str, tuple[float, float]]:
+    """Place each (key, radius) disc so NO two overlap, largest first, by
+    walking an Archimedean spiral outward from the origin and taking the
+    first position that clears every disc already placed.
+
+    Greedy and O(n^2) in the number of discs — fine for the scale this runs
+    at (tens of classes per corpus, not thousands) and, unlike a physics
+    relaxation, it terminates with a hard non-overlap guarantee rather than
+    an approximate one. Largest-first matters: placing a big disc after the
+    small ones would push it far out past a ring of small discs it could
+    have sat inside.
+    """
+    import math
+
+    placed: list[tuple[float, float, float]] = []
+    out: dict[str, tuple[float, float]] = {}
+    gap = 60.0  # visual breathing room between two hull edges
+    for key, radius in sorted(sizes, key=lambda kv: -kv[1]):
+        if not placed:
+            out[key] = (0.0, 0.0)
+            placed.append((0.0, 0.0, radius))
+            continue
+        # Spiral step is tied to the disc being placed so a large disc takes
+        # coarse steps (it needs a large clearing anyway) and a small one
+        # searches finely — a fixed step either crawls for big discs or
+        # skips over gaps a small disc would have fit into.
+        step = max(radius * 0.35, 25.0)
+        theta = 0.0
+        while True:
+            r = step * theta / (2 * math.pi)
+            x, y = r * math.cos(theta), r * math.sin(theta)
+            if all(
+                math.hypot(x - px, y - py) >= radius + pr + gap
+                for px, py, pr in placed
+            ):
+                out[key] = (x, y)
+                placed.append((x, y, radius))
+                break
+            theta += 0.35
+    return out
+
+
+def _class_cluster_layout(
+    G: nx.DiGraph,
+) -> "tuple[dict[str, dict[str, float]], dict[str, tuple[float, float, float]]]":
+    """Fixed (x, y) positions for EVERY class in the graph and its own
+    members, laid out so class regions never overlap each other.
+
+    The default force-directed physics positions a method by the CALL
+    graph, which routinely interleaves two different classes' methods in
+    the same screen region (a class's methods call all over the codebase,
+    not just each other), so a boundary drawn around a class over physics
+    positions collides with its neighbors by construction — no amount of
+    hull styling fixes that. This assigns each class its own disc instead
+    (see `_pack_discs`, which guarantees non-overlap), and scatters that
+    class's own node plus its members inside that disc
+    (`_stable_unit_pair`) — deliberately NOT on a regular ring: the members'
+    arrangement WITHIN a class carries no meaning worth encoding, and a
+    visible ring implies an ordering that doesn't exist.
+
+    Covers every node with `_callable_class` set (graphify's own extractor
+    attribute — see extractors/engine.py), not just the god nodes a
+    decouple plan analyzed: a class boundary is a fact about the code, true
+    whether or not that particular class scored high enough to be a split
+    candidate. A class with no members is skipped — there is no region to
+    draw, and pinning a lone node would only fight the physics layout for
+    nothing.
+
+    Free functions — real callables that belong to no class — are grouped
+    by their own SOURCE FILE into module regions, so every implementation
+    node ends up inside some boundary rather than floating unattached
+    (measured on a real corpus: 368 callable nodes, most of a procedural
+    module's content, sat outside every class region). A module region is
+    the same kind of statement a class region is: "this is one unit".
+    Nodes that are pure DECLARATION rather than implementation are
+    deliberately left out — the synthetic file-level hub node graphify's
+    extractor creates per file, method stubs, and external symbols with no
+    source file of their own (`numpy.ndarray` and friends): they declare
+    that something exists elsewhere, they are not code living in this unit.
+
+    Returns `(positions, discs)` — `discs` maps each region's key (a class
+    node id, or a `_module::<path>` synthetic key) to its
+    `(center_x, center_y, radius)`. The renderer draws THAT circle rather
+    than fitting an ellipse to the member positions: the disc is the exact
+    region `_pack_discs` proved non-overlapping, whereas a fitted ellipse
+    has to be padded outward to cover every member and can then cross into
+    a neighbor (measured on a real corpus: 7 overlapping pairs from fitting
+    alone, on a layout whose discs were provably disjoint).
+    """
+    from graphify.analyze import _is_file_node
+
+    sizes: list[tuple[str, float]] = []
+    members_by_class: dict[str, list[str]] = {}
+    in_a_class: set[str] = set()
+    for nid, data in G.nodes(data=True):
+        if not data.get("_callable_class"):
+            continue
+        members = member_ids(G, nid)
+        if not members:
+            continue
+        members_by_class[nid] = members
+        in_a_class.add(nid)
+        in_a_class.update(members)
+        sizes.append((nid, _class_disc_radius(len(members))))
+
+    # Module regions for the free functions left over.
+    free_by_file: dict[str, list[str]] = {}
+    for nid, data in G.nodes(data=True):
+        if nid in in_a_class:
+            continue
+        if data.get("file_type") != "code" or not data.get("_callable"):
+            continue
+        if data.get("_callable_class"):
+            continue  # a memberless class: no region, see above
+        source_file = str(data.get("source_file") or "")
+        if not source_file:
+            continue  # external symbol — declared elsewhere, not code here
+        if _is_file_node(G, nid):
+            continue  # synthetic file hub / stub — declaration, not implementation
+        free_by_file.setdefault(source_file, []).append(nid)
+    for source_file, free_nodes in free_by_file.items():
+        if len(free_nodes) < 2:
+            continue  # a lone function is not a "unit" worth outlining
+        key = f"_module::{source_file}"
+        members_by_class[key] = sorted(free_nodes)
+        sizes.append((key, _class_disc_radius(len(free_nodes))))
+
+    if not sizes:
+        return {}, {}
+
+    import math
+
+    anchors = _pack_discs(sizes)
+    positions: dict[str, dict[str, float]] = {}
+    discs: dict[str, tuple[float, float, float]] = {}
+    for class_id, members in members_by_class.items():
+        ax, ay = anchors[class_id]
+        radius = _class_disc_radius(len(members))
+        # A module region has no node of its own to pin (its key is
+        # synthetic) — only its members get positions.
+        if not class_id.startswith("_module::"):
+            positions[class_id] = {"x": ax, "y": ay}
+        discs[class_id] = (ax, ay, radius)
+        for m in members:
+            angle_unit, radius_unit = _stable_unit_pair(f"{class_id}::{m}")
+            angle = angle_unit * 2 * math.pi
+            # sqrt() on the radial term spreads points evenly over AREA;
+            # using the raw uniform value would visibly bunch them toward
+            # the disc's center.
+            r = math.sqrt(radius_unit) * radius * 0.82
+            positions[m] = {"x": ax + r * math.cos(angle), "y": ay + r * math.sin(angle)}
+
+    # Scale the whole packed layout up to the same order of magnitude the
+    # browser's forceAtlas2Based physics spreads the REST of the graph over
+    # (everything not in a class — free functions, docs, config — still
+    # settles at runtime, and this Python-side layout cannot see where).
+    # Empirically that spread grows with sqrt(node count): a ~1200-node
+    # corpus settles to roughly ±3700 units, while the packed discs alone
+    # came to ±1477 — leaving every class boundary crammed into the middle
+    # 40% of the canvas and buried under the free nodes drawn over them.
+    # Scaling uniformly preserves the non-overlap guarantee (every pairwise
+    # distance grows by the same factor) and enlarges the regions
+    # themselves, rather than only spreading their centers further apart.
+    extent = max(
+        (max(abs(p["x"]), abs(p["y"])) for p in positions.values()),
+        default=0.0,
+    )
+    target_extent = 140.0 * math.sqrt(G.number_of_nodes())
+    if extent > 0 and target_extent > extent:
+        scale = target_extent / extent
+        for p in positions.values():
+            p["x"] *= scale
+            p["y"] *= scale
+        # Radii scale with the centers — scaling only the centers would
+        # spread the discs apart while leaving each region the same small
+        # size, which is what made them invisible at corpus scale.
+        discs = {k: (cx * scale, cy * scale, r * scale) for k, (cx, cy, r) in discs.items()}
+    return positions, discs
+
+
+def _resolve_function_node(G: nx.DiGraph, source_file: str, name: str) -> "str | None":
+    """Best-effort match of a `tool_dedup` function fingerprint (bare name +
+    source_file, tree-sitter/`ast`-derived) to a real graph node id
+    (graphify's own extractor, a SEPARATE pass over the same file). Matches
+    on source_file + a label equal to `name` once graphify's own decoration
+    (a leading "." for a method, a trailing "()") is stripped. Returns None
+    — a skip, not a guess — when zero or more than one node matches; an
+    ambiguous match drawn on the graph would be actively misleading."""
+    candidates = [
+        nid for nid, data in G.nodes(data=True)
+        if data.get("source_file") == source_file
+        and str(data.get("label", "")).strip().lstrip(".").rstrip("()") == name
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _resolve_class_node(G: nx.DiGraph, container: "str | None", source_file: "str | None") -> "str | None":
+    """Same idea as `_resolve_function_node`, for a class name instead of a
+    function name — used to find the real node for a merge_target's
+    `target_container`."""
+    if container is None:
+        return None
+    return _resolve_function_node(G, source_file or "", container)
+
+
+def overlay_tool_dedup_clusters(
+    G: nx.DiGraph,
+    communities: dict[int, list[str]],
+    report: dict[str, Any],
+) -> tuple[nx.Graph, dict[int, list[str]]]:
+    """Overlay a `tool_dedup.find_duplicate_function_clusters` report's
+    consolidation candidates onto a COPY of `G` as WIRING — never as a
+    background region. Background tints are reserved exclusively for class
+    boundaries (see `_class_cluster_layout`); a consolidation is a proposed
+    CHANGE to the code, in the same category as a split, so it belongs in
+    the same "Preview decoupled view" vocabulary the splits use (proposed
+    nodes + proposed edges), not in the vocabulary that means "this is one
+    class".
+
+    `tool_dedup` finds functions from source files directly (tree-sitter),
+    independently of graphify's own extraction — the two do not share an id
+    scheme. Each cluster member is resolved back to a real graph node via
+    `_resolve_function_node` FIRST; a cluster where fewer than 2 members
+    resolve is skipped entirely (skipped, never drawn with a guessed
+    position) — this is expected to under-report, not over-report.
+
+    - `merge_into_existing`: a dashed `merge_candidate` edge from each
+      resolved duplicate to the existing target class's node — "this would
+      move into that class".
+    - `independent`: a new `kind="proposed"` node (same visual vocabulary as
+      a split's diamond — hidden by default, shown by the same "Preview
+      decoupled view" toggle) representing the not-yet-created shared
+      class/module, with a `merge_candidate` edge from each duplicate.
+
+    Can be combined with `build_augmented_graph`'s output by calling this
+    SECOND on its result — proposed nodes/edges accumulate, and the class
+    hulls that function created are read and preserved untouched.
+    """
+    G2 = G.copy()
+    communities2 = {cid: list(members) for cid, members in communities.items()}
+    hulls: list[dict[str, Any]] = list(G.graph.get("hyperedges", []))
+    counter = 0
+
+    for cluster in report.get("clusters", []):
+        resolved = [
+            (m, _resolve_function_node(G2, m["source_file"], m["name"]))
+            for m in cluster["members"]
+        ]
+        resolved_ids = [nid for _m, nid in resolved if nid is not None]
+        if len(resolved_ids) < 2:
+            continue
+
+        mt = cluster["merge_target"]
+        if mt["recommendation"] == "merge_into_existing":
+            target_id = _resolve_class_node(G2, mt["target_container"], mt["target_source_file"])
+        else:
+            target_id = f"_merge_proposed_{counter}"
+            counter += 1
+            sample_name = cluster["members"][0]["name"]
+            G2.add_node(
+                target_id,
+                label=f"(shared) {sample_name}",
+                file_type="concept",
+                source_file="",
+                kind="proposed",
+                hidden=True,
+                decouple_recommendation="merge",
+                member_count=len(resolved_ids),
+            )
+            # Best-effort placement at the centroid of whichever resolved
+            # duplicates already have a class-cluster position (see
+            # build_augmented_graph/_class_cluster_layout) — NOT a hard
+            # guarantee like the class layer's: a duplicate outside any
+            # analyzed class (most of them, in practice — see this
+            # function's own docstring) has no cluster position to average,
+            # so this can fall back to nothing, leaving the node
+            # physics-placed. Only the "class" layer promises no overlap.
+            positioned = [
+                (G2.nodes[nid]["cluster_x"], G2.nodes[nid]["cluster_y"])
+                for nid in resolved_ids
+                if "cluster_x" in G2.nodes.get(nid, {})
+            ]
+            if positioned:
+                G2.nodes[target_id]["cluster_x"] = sum(p[0] for p in positioned) / len(positioned)
+                G2.nodes[target_id]["cluster_y"] = sum(p[1] for p in positioned) / len(positioned)
+
+        # NO hull for a merge candidate, for the same reason a split gets
+        # none (see build_augmented_graph): a background tint already means
+        # "this is one class", and a second wash of regions over the class
+        # boundaries hid the thing they were drawn on top of. The
+        # consolidation is expressed as WIRING instead — a
+        # `merge_candidate` edge from each scattered duplicate to the place
+        # it would move into, revealed by the same "Preview decoupled view"
+        # toggle as the split diamonds.
+        if target_id is not None:
+            for nid in resolved_ids:
+                if nid == target_id:
+                    continue
+                G2.add_edge(
+                    nid, target_id,
+                    relation="merge_candidate",
+                    confidence="INFERRED",
+                    kind="proposed_edge",
+                    decouple_recommendation="merge",
+                    _src=nid, _tgt=target_id,
+                )
+
+    G2.graph["hyperedges"] = hulls
+    return G2, communities2
 
 
 def build_augmented_graph(
@@ -837,11 +1222,84 @@ def build_augmented_graph(
     community's legend entry hides the proposed extraction along with the
     real members it would be made of. Residual groups (`community_id is
     None`) are never drawn — they stay on the original class, not a split.
+
+    Every analyzed class also gets a HULL — a shaded boundary drawn around
+    itself and its own existing members (via `exporters.html`'s hyperedge
+    renderer; see `_hyperedge_script`) — regardless of whether a split is
+    recommended. This exists because a flat node-and-edge graph cannot show
+    "these methods already live in the same class" as anything other than
+    edges identical in kind to every other edge: nothing distinguishes
+    "these nodes happen to be connected" from "these nodes are the SAME
+    class". A baseline hull, colored per-class from the same categorical
+    palette used for community coloring elsewhere in the app, answers that
+    directly, and a recommended split then gets its OWN green hull around
+    the diamond + the real members it would take — so a class splitting is
+    visible as one hull becoming several (in a NEW color, not just "the same
+    class's hull, but smaller"), not just as new edges appearing. Baseline
+    hulls use the existing class's own node id + `entry["members"]`; split
+    hulls use a group's diamond id + `g["members"]` — appended to (never
+    replacing) whatever hyperedges the graph already carries (e.g.
+    README-derived semantic groupings), tagged with `fill`/`stroke`/`dashed`
+    so they render in a visually distinct style from those.
     """
+    from graphify.exporters.base import COMMUNITY_COLORS
+
     G2 = G.copy()
     communities2 = {cid: list(members) for cid, members in communities.items()}
     member_to_diamond: dict[str, str] = {}
     diamond_ids: set[str] = set()
+    hulls: list[dict[str, Any]] = list(G.graph.get("hyperedges", []))
+
+    # Non-overlapping positions for EVERY class in the graph + its members
+    # (see _class_cluster_layout) — stamped as `cluster_x`/`cluster_y` node
+    # attributes, NOT applied as the node's actual `x`/`y` here.
+    # exporters.html's "Class boundaries" toggle (checked by default) is
+    # what actually fixes nodes to these coordinates in the browser;
+    # unchecking it lets physics take back over. Stamping happens
+    # regardless of that toggle's default so the data is there either way.
+    cluster_positions, class_discs = _class_cluster_layout(G)
+    for nid, pos in cluster_positions.items():
+        if nid in G2.nodes:
+            G2.nodes[nid]["cluster_x"] = pos["x"]
+            G2.nodes[nid]["cluster_y"] = pos["y"]
+
+    # A boundary for EVERY class, not only the god nodes this plan analyzed:
+    # "these methods live in this class" is a fact about the code, equally
+    # true for a class that never scored high enough to be a split
+    # candidate. Each gets its own color from the same categorical palette
+    # used for community coloring elsewhere in the app — one flat color for
+    # every class made adjacent boundaries indistinguishable from each
+    # other. Ordered by node id so the color assignment is stable across
+    # runs (dict iteration order follows insertion, which follows the
+    # graph's own node order — stable for a given graph.json, but sorting
+    # makes that independent of it).
+    for i, region_id in enumerate(sorted(class_discs)):
+        cx, cy, radius = class_discs[region_id]
+        color = COMMUNITY_COLORS[i % len(COMMUNITY_COLORS)]
+        if region_id.startswith("_module::"):
+            # A module region groups the free functions of one file — same
+            # kind of "this is one unit" statement as a class region, drawn
+            # identically, labeled by the file it came from.
+            source_file = region_id[len("_module::"):]
+            region_nodes = [
+                nid for nid in cluster_positions
+                if G.nodes.get(nid, {}).get("source_file") == source_file
+            ]
+            label = source_file.rsplit("/", 1)[-1]
+        else:
+            region_nodes = [region_id] + list(member_ids(G, region_id))
+            label = G.nodes[region_id].get("label", region_id)
+        hulls.append({
+            "nodes": region_nodes,
+            "label": label,
+            "fill": color, "stroke": color, "labelColor": color,
+            "layer": "class",
+            # Explicit geometry — the exact disc `_pack_discs` proved
+            # disjoint. The renderer uses this instead of fitting an
+            # ellipse to member positions, which has to pad outward to
+            # cover every member and can then cross into a neighbor.
+            "cx": cx, "cy": cy, "r": radius,
+        })
     # G2 is a plain (non-multi) DiGraph — add_edge on an existing pair
     # OVERWRITES it rather than adding a parallel edge. A member that itself
     # calls another member of ITS OWN god node via a non-ownership relation
@@ -920,6 +1378,25 @@ def build_augmented_graph(
                 member_to_diamond[m] = node_id
                 if m in G2.nodes:
                     G2.nodes[m]["decouple_extracted_into"] = node_id
+            # Place the diamond at its own god class's cluster anchor — it is
+            # a NEW node _class_cluster_layout never saw, but it belongs
+            # conceptually at the class it was extracted from, not wherever
+            # physics happens to drop it.
+            if god_id in G2.nodes and "cluster_x" in G2.nodes[god_id]:
+                G2.nodes[node_id]["cluster_x"] = G2.nodes[god_id]["cluster_x"]
+                G2.nodes[node_id]["cluster_y"] = G2.nodes[god_id]["cluster_y"]
+            # NO hull for a proposed split group. A background tint says
+            # "these belong together", which is exactly the CLASS
+            # relationship — reusing it for "these would be pulled OUT into
+            # a new class" overloads the same visual with a second,
+            # unrelated meaning, and drawing both at once buried the class
+            # boundaries under a wash of near-identical regions. The split
+            # is already fully expressed inside the decouple preview
+            # itself: the ◆ diamond, its `extract` edge, and the redirected
+            # wiring below (all revealed together by "Preview decoupled
+            # view").
+
+    G2.graph["hyperedges"] = hulls
 
     if not member_to_diamond:
         return G2, communities2
@@ -980,6 +1457,17 @@ def render_markdown(plan: dict[str, Any]) -> str:
             f"- afferent={entry['afferent']} efferent={entry['efferent']} "
             f"member_count={entry['member_count']} member_ratio={entry['member_ratio']}"
         )
+        fp = entry.get("floor_profile")
+        if fp:
+            span_note = (
+                f" — straddles {fp['floor_span'] + 1} data-flow floors "
+                f"(cross_floor_risk={entry.get('floor_risk')})"
+                if fp["floor_span"] else " — single floor"
+            )
+            lines.append(
+                f"- data-flow floor={fp['floor']} (range {fp['min_floor']}-{fp['max_floor']})"
+                f"{span_note}"
+            )
         if entry["classification"] == "god_object":
             risk = entry.get("risk", {})
             sd = risk.get("split_detail", {})

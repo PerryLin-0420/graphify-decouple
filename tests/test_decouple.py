@@ -26,6 +26,7 @@ from graphify.decouple import (
     hub_suggestion,
     member_ids,
     original_risk_score,
+    overlay_tool_dedup_clusters,
     render_markdown,
     split_risk_score,
 )
@@ -43,7 +44,7 @@ def _build_graph():
     g = nx.DiGraph()
 
     # --- god_object: "GodClass" — 6 members split across 2 communities ---
-    g.add_node("god", label="GodClass", file_type="code", source_file="mod.py", source_location="L1")
+    g.add_node("god", label="GodClass", file_type="code", _callable_class=True, source_file="mod.py", source_location="L1")
     for i in range(3):
         _add_member(g, "god", f"m{i}", label=f".m{i}()", source_file="mod.py")
     for i in range(3, 6):
@@ -59,13 +60,13 @@ def _build_graph():
         g.add_edge(f"caller{i}", "god", relation="calls", confidence="EXTRACTED")
 
     # --- over_referenced_hub: "HubClass" — 0 own members, 10 callers ---
-    g.add_node("hub", label="HubClass", file_type="code", source_file="hub.py", source_location="L1")
+    g.add_node("hub", label="HubClass", file_type="code", _callable_class=True, source_file="hub.py", source_location="L1")
     for i in range(10):
         g.add_node(f"hubcaller{i}", label=f"hc{i}()", file_type="code", source_file="hcaller.py", source_location="L1")
         g.add_edge(f"hubcaller{i}", "hub", relation="calls", confidence="EXTRACTED")
 
     # --- cohesive_but_large: "BigClass" — 5 members, all one community ---
-    g.add_node("big", label="BigClass", file_type="code", source_file="big.py", source_location="L1")
+    g.add_node("big", label="BigClass", file_type="code", _callable_class=True, source_file="big.py", source_location="L1")
     for i in range(5):
         _add_member(g, "big", f"b{i}", label=f".b{i}()", source_file="big.py")
     g.add_node("bigcaller", label="bigcaller()", file_type="code", source_file="caller.py", source_location="L1")
@@ -75,7 +76,7 @@ def _build_graph():
     # communities, but the two groups call into each other AND share external
     # callers that depend on both. Structurally still god_object (member_ratio
     # high, 2 communities), but the split itself should be discouraged.
-    g.add_node("tangled", label="TangledClass", file_type="code", source_file="tangled.py", source_location="L1")
+    g.add_node("tangled", label="TangledClass", file_type="code", _callable_class=True, source_file="tangled.py", source_location="L1")
     for i in range(3):
         _add_member(g, "tangled", f"t{i}", label=f".t{i}()", source_file="tangled.py")
     for i in range(3, 6):
@@ -100,7 +101,7 @@ def _build_graph():
     # count and same straddling_callers as "tangled", only the direction
     # differs, so any score difference between the two is attributable to
     # the dag/cyclic discount alone.
-    g.add_node("pipeline", label="PipelineClass", file_type="code", source_file="pipeline.py", source_location="L1")
+    g.add_node("pipeline", label="PipelineClass", file_type="code", _callable_class=True, source_file="pipeline.py", source_location="L1")
     for i in range(3):
         _add_member(g, "pipeline", f"p{i}", label=f".p{i}()", source_file="pipeline.py")
     for i in range(3, 6):
@@ -497,6 +498,104 @@ def test_build_augmented_graph_skips_discouraged_god_object():
     assert not any(n.startswith("_proposed_tangled_") for n in g2.nodes)
 
 
+# ── overlay_tool_dedup_clusters ──────────────────────────────────────────────
+
+def _dup_member(source_file, name, container=None):
+    return {"source_file": source_file, "name": name, "container": container, "lineno": 1, "param_count": 1, "calls": []}
+
+
+def test_overlay_merges_into_existing_class_node():
+    g = nx.DiGraph()
+    g.add_node("loader_load", label="load()", file_type="code", source_file="a.py")
+    g.add_node("settings_load", label="load()", file_type="code", source_file="b.py")
+    g.add_node("loader_class", label="Loader", file_type="code", source_file="a.py")
+    report = {"clusters": [{
+        "members": [_dup_member("a.py", "load", "Loader"), _dup_member("b.py", "load")],
+        "merge_target": {
+            "recommendation": "merge_into_existing",
+            "target_container": "Loader", "target_source_file": "a.py",
+            "candidates": [], "rationale": "x",
+        },
+    }]}
+    g2, _ = overlay_tool_dedup_clusters(g, {}, report)
+    assert g2.has_edge("settings_load", "loader_class")
+    assert g2["settings_load"]["loader_class"]["relation"] == "merge_candidate"
+    # Consolidation is drawn as WIRING, never as a background region —
+    # background regions mean "this is one class" and nothing else.
+    assert g2.graph["hyperedges"] == []
+
+
+def test_overlay_independent_creates_proposed_shared_node():
+    g = nx.DiGraph()
+    g.add_node("a_load", label="load()", file_type="code", source_file="a.py")
+    g.add_node("b_load", label="load()", file_type="code", source_file="b.py")
+    report = {"clusters": [{
+        "members": [_dup_member("a.py", "load"), _dup_member("b.py", "load")],
+        "merge_target": {
+            "recommendation": "independent",
+            "target_container": None, "target_source_file": None,
+            "candidates": [], "rationale": "x",
+        },
+    }]}
+    g2, _ = overlay_tool_dedup_clusters(g, {}, report)
+    proposed = [n for n, d in g2.nodes(data=True) if d.get("kind") == "proposed"]
+    assert len(proposed) == 1
+    assert g2.nodes[proposed[0]]["hidden"] is True
+    assert g2.has_edge("a_load", proposed[0])
+    assert g2.has_edge("b_load", proposed[0])
+
+
+def test_overlay_skips_cluster_with_unresolvable_members():
+    g = nx.DiGraph()
+    g.add_node("only_one", label="load()", file_type="code", source_file="a.py")
+    report = {"clusters": [{
+        "members": [_dup_member("a.py", "load"), _dup_member("nonexistent.py", "load")],
+        "merge_target": {"recommendation": "independent", "target_container": None,
+                          "target_source_file": None, "candidates": [], "rationale": "x"},
+    }]}
+    g2, _ = overlay_tool_dedup_clusters(g, {}, report)
+    assert g2.graph["hyperedges"] == []
+    assert not any(d.get("kind") == "proposed" for _n, d in g2.nodes(data=True))
+
+
+def test_overlay_preserves_class_hulls_from_build_augmented_graph():
+    """Composability contract: calling overlay_tool_dedup_clusters SECOND, on
+    build_augmented_graph's own output, must leave the class hulls that
+    function created untouched — it adds wiring, never regions."""
+    g = _build_graph()
+    communities = _communities_for(g)
+    plan = decouple_plan(g, communities, top_n=20, min_group_size=3)
+    g2, communities2 = build_augmented_graph(g, plan, communities)
+    hulls_before = g2.graph.get("hyperedges", [])
+    assert len(hulls_before) > 0
+    assert all(h["layer"] == "class" for h in hulls_before)
+
+    g2.add_node("dup_a", label="helper()", file_type="code", source_file="extra_a.py")
+    g2.add_node("dup_b", label="helper()", file_type="code", source_file="extra_b.py")
+    report = {"clusters": [{
+        "members": [_dup_member("extra_a.py", "helper"), _dup_member("extra_b.py", "helper")],
+        "merge_target": {"recommendation": "independent", "target_container": None,
+                          "target_source_file": None, "candidates": [], "rationale": "x"},
+    }]}
+    g3, _ = overlay_tool_dedup_clusters(g2, communities2, report)
+    assert g3.graph["hyperedges"] == hulls_before  # unchanged, not appended to
+
+
+def test_build_augmented_graph_hulls_cover_every_class_not_just_god_nodes():
+    """A class boundary is a fact about the code, not a property of scoring
+    high enough to be a split candidate — every class with members gets one,
+    including "BigClass" (cohesive_but_large, never split) and the classes a
+    top_n cutoff would exclude."""
+    g = _build_graph()
+    communities = _communities_for(g)
+    plan = decouple_plan(g, communities, top_n=2, min_group_size=3)  # only 2 god nodes analyzed
+    g2, _ = build_augmented_graph(g, plan, communities)
+    labels = {h["label"] for h in g2.graph["hyperedges"]}
+    # every class WITH members, regardless of what the plan looked at
+    assert labels == {"GodClass", "BigClass", "TangledClass", "PipelineClass"}
+    assert "HubClass" not in labels  # no members -> no region to draw
+
+
 def test_write_decouple_html_reuses_visjs_style(tmp_path):
     g = _build_graph()
     communities = _communities_for(g)
@@ -508,6 +607,26 @@ def test_write_decouple_html_reuses_visjs_style(tmp_path):
     assert "mermaid" not in html.lower()
     assert "Show risk scores" in html  # toggle present because a proposed node exists
     assert '"shape":"diamond"' in html or '"shape": "diamond"' in html
+
+
+def test_write_decouple_html_overlays_tool_dedup_report(tmp_path):
+    g = _build_graph()
+    g.add_node("dup_a", label="helper()", file_type="code", source_file="extra_a.py")
+    g.add_node("dup_b", label="helper()", file_type="code", source_file="extra_b.py")
+    communities = _communities_for(g)
+    plan = decouple_plan(g, communities, top_n=20, min_group_size=3)
+    report = {"clusters": [{
+        "members": [_dup_member("extra_a.py", "helper"), _dup_member("extra_b.py", "helper")],
+        "merge_target": {"recommendation": "independent", "target_container": None,
+                          "target_source_file": None, "candidates": [], "rationale": "x"},
+    }]}
+    out = tmp_path / "DECOUPLE.html"
+    write_decouple_html(g, plan, communities, {}, out, tool_dedup_report=report)
+    html = out.read_text(encoding="utf-8")
+    # the proposed shared home is a NODE (revealed by "Preview decoupled
+    # view"), not a background region
+    assert "(shared) helper" in html
+    assert "merge_candidate" in html
 
 
 # ── CLI end-to-end (smoke) ────────────────────────────────────────────────────
