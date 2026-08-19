@@ -8,20 +8,35 @@ are three different jobs, and one class doing all three is a problem the
 call-graph metrics can't see (its members can be perfectly cohesive by
 call structure while still spanning the whole pipeline).
 
-Floors are BFS distance from the system's I/O boundary:
+Floors are the LONGEST directed path (in hops) from the system's I/O
+boundary:
 
   - Floor 0 = the boundary itself — where data enters or leaves the process
     (parsers, loaders, readers, writers, exporters, DB/HTTP clients). Both
     ends count: "first data source OR output point".
-  - Floor 1 = everything directly touching floor 0.
-  - Floor N = N hops from the nearest boundary node.
+  - Floor N = the length of the LONGEST call chain from any boundary node
+    to this one — not the shortest. A node reachable from the boundary via
+    both a direct shortcut edge (1 hop) AND a long serial chain (say 4
+    hops through 3 intermediate stages) is genuinely downstream of that
+    4-stage pipeline; reporting the shortcut's floor would hide the actual
+    depth of what it depends on. This is "worst-case propagation depth",
+    not "closest possible route".
 
-Distance is measured on the UNDIRECTED graph. A call edge's direction says
-who invokes whom, which is not the same as which way data moves (a parser
-called BY a controller still supplies data TO it), and resolving true data
-direction needs dataflow analysis this module does not attempt. Undirected
-distance answers the question it can actually answer honestly: "how many
-hops from the boundary is this?"
+Computed on the graph's strongly-connected-component CONDENSATION
+(`nx.condensation`), not the raw graph: longest path is only well-defined
+on a DAG, and a genuine dependency cycle (A calls B calls A) has no longest
+path at all (the cycle could be walked any number of times). Every node in
+the SAME strongly connected component shares ONE floor — they are mutually
+reachable, so there is no "who is upstream of whom" between them to
+measure; a whole SCC is treated as a single indivisible unit for this
+purpose.
+
+Distance is measured on the DIRECTED graph — call direction is who-invokes-
+whom, which is not strictly the same thing as which way data moves (a
+parser called BY a controller still supplies data TO it), and resolving
+true data direction would need dataflow analysis this module does not
+attempt. Call direction is the only direction available, and "longest
+path" is meaningless without one to be long ALONG.
 
 Honest limits:
   - Boundary detection is a NAME heuristic (path tokens + symbol-name
@@ -32,13 +47,16 @@ Honest limits:
     taken on faith.
   - A graph with no detectable boundary yields NO floors at all (an empty
     dict), not a fabricated layering rooted at an arbitrary node.
-  - Nodes in a component with no boundary node are absent from the result —
-    unreachable, not floor 0.
+  - Nodes in a component with no boundary node reachable INTO them are
+    absent from the result — unreachable, not floor 0.
+  - A boundary node's own floor is fixed at 0 even if some OTHER, longer
+    chain also happens to reach it — being an I/O boundary is what floor 0
+    MEANS, not a distance to be second-guessed by a path through something
+    else.
 """
 from __future__ import annotations
 
 import re
-from collections import deque
 from typing import Any
 
 import networkx as nx
@@ -126,19 +144,25 @@ def boundary_reason(G: nx.Graph, node_id: str) -> "str | None":
     return None
 
 
-def compute_floors(G: nx.Graph) -> "tuple[dict[str, int], dict[str, str]]":
-    """BFS distance from the nearest I/O boundary node, for every node
-    reachable from one.
+def compute_floors(G: "nx.DiGraph") -> "tuple[dict[str, int], dict[str, str]]":
+    """Longest directed-path distance (hops) from the nearest I/O boundary
+    node, computed on `G`'s strongly-connected-component condensation —
+    see the module docstring for why longest (not shortest) and why the
+    condensation (cycles have no longest path otherwise).
 
     Returns `(floors, boundary_reasons)`. `floors` maps node id -> floor;
-    a node in a component containing no boundary node is ABSENT (unknown
-    floor), never defaulted to 0. `boundary_reasons` maps each floor-0 node
-    to the `boundary_reason` that put it there.
+    a node in an SCC with no boundary node reachable into it is ABSENT
+    (unknown floor), never defaulted to 0. `boundary_reasons` maps each
+    floor-0 node to the `boundary_reason` that put it there.
 
-    Deterministic: seeds and neighbors are visited in sorted id order, so
-    the same graph always yields the same floors (ties in BFS distance
-    cannot produce different results anyway, but sorting keeps the
-    traversal itself reproducible for debugging).
+    Deterministic: `nx.condensation`'s SCC numbering only depends on `G`'s
+    own (insertion-ordered) structure, and every set this function iterates
+    over for tie-breaking is sorted before use — the same graph always
+    yields the same floors.
+
+    Requires a DIRECTED `G` — `nx.condensation` (and "longest path" itself,
+    which needs a direction to be long ALONG) are undefined for an
+    undirected graph.
     """
     reasons: dict[str, str] = {}
     for nid in sorted(G.nodes):
@@ -148,15 +172,41 @@ def compute_floors(G: nx.Graph) -> "tuple[dict[str, int], dict[str, str]]":
     if not reasons:
         return {}, {}
 
-    floors: dict[str, int] = {nid: 0 for nid in reasons}
-    queue: deque[str] = deque(sorted(reasons))
-    while queue:
-        current = queue.popleft()
-        for neighbor in sorted(nx.all_neighbors(G, current)) if G.is_directed() else sorted(G.neighbors(current)):
-            if neighbor in floors:
-                continue
-            floors[neighbor] = floors[current] + 1
-            queue.append(neighbor)
+    # Condensed on the REVERSED graph, not G itself: a call edge (u, v)
+    # means "u calls v", i.e. v is closer to the boundary than u is (u is
+    # the one downstream, consuming whatever v produces). Floor must
+    # increase walking from a boundary node OUT TO ITS CALLERS, which is
+    # the successor direction on G.reverse(), not on G — reversing first
+    # lets the same forward topological-sort/relax loop below do the
+    # right thing. SCC membership is identical either way (a cycle is a
+    # cycle regardless of which way it's read), so this doesn't change
+    # which nodes get condensed together, only which way floors flow.
+    condensation = nx.condensation(G.reverse(copy=False))
+    node_to_scc: dict[str, int] = condensation.graph["mapping"]
+
+    seed_sccs = {node_to_scc[n] for n in reasons}
+    floors_scc: dict[int, int] = {s: 0 for s in seed_sccs}
+
+    # nx.condensation is a DAG by construction (SCCs cannot cycle among
+    # themselves — if they did, they would BE one SCC), so topological
+    # order always exists. Processing SCCs in that order and relaxing only
+    # FORWARD (to already-later nodes) is the standard longest-path-in-DAG
+    # algorithm: by the time an SCC is visited, every predecessor that
+    # could still improve its floor has already been fully processed.
+    for scc in nx.topological_sort(condensation):
+        if scc not in floors_scc:
+            continue  # not (yet, or ever) reached from any boundary seed
+        base = floors_scc[scc]
+        for succ in sorted(condensation.successors(scc)):
+            if succ in seed_sccs:
+                continue  # a boundary SCC's floor is fixed at 0, never overwritten
+            candidate = base + 1
+            if succ not in floors_scc or candidate > floors_scc[succ]:
+                floors_scc[succ] = candidate
+
+    floors: dict[str, int] = {
+        n: floors_scc[scc] for n, scc in node_to_scc.items() if scc in floors_scc
+    }
     return floors, reasons
 
 

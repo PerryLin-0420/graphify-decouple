@@ -63,7 +63,9 @@ def test_path_token_matches_whole_tokens_not_substrings():
 
 # ── compute_floors ───────────────────────────────────────────────────────────
 
-def test_floors_are_bfs_distance_from_boundary():
+def test_floors_increase_toward_callers_of_the_boundary():
+    """mid calls parser, ui calls mid: floor increases one hop per caller
+    away from the boundary, not one hop per callee."""
     g = nx.DiGraph()
     _code(g, "parser", "parse_file()", source_file="app/parser/p.py")
     _code(g, "mid", "transform()", source_file="app/core/c.py")
@@ -73,6 +75,39 @@ def test_floors_are_bfs_distance_from_boundary():
     floors, reasons = compute_floors(g)
     assert floors == {"parser": 0, "mid": 1, "ui": 2}
     assert "parser" in reasons
+
+
+def test_floor_is_the_longest_chain_not_the_shortest_shortcut():
+    """x is reachable from the boundary via a direct 1-hop shortcut AND via
+    a 3-hop chain through b/c. x's floor must reflect the longer chain (3),
+    not the shortcut (1) — reporting the shortcut would hide how deep x's
+    actual dependency really goes."""
+    g = nx.DiGraph()
+    _code(g, "boundary", "load_config()", source_file="app/core/thing.py")
+    _code(g, "x", "compute()", source_file="app/core/x.py")
+    _code(g, "b", "step_b()", source_file="app/core/b.py")
+    _code(g, "c", "step_c()", source_file="app/core/c.py")
+    g.add_edge("x", "boundary", relation="calls")  # shortcut: x is 1 hop from boundary
+    g.add_edge("b", "boundary", relation="calls")
+    g.add_edge("c", "b", relation="calls")
+    g.add_edge("x", "c", relation="calls")  # long chain: x -> c -> b -> boundary (3 hops)
+    floors, _ = compute_floors(g)
+    assert floors["x"] == 3
+
+
+def test_mutually_calling_pair_shares_one_floor():
+    """a and b call each other (a genuine cycle, not a chain) — they form
+    one strongly-connected component and must share a single floor rather
+    than each claiming a distance from the other."""
+    g = nx.DiGraph()
+    _code(g, "boundary", "load_config()", source_file="app/core/thing.py")
+    _code(g, "a", "step_a()", source_file="app/core/a.py")
+    _code(g, "b", "step_b()", source_file="app/core/b.py")
+    g.add_edge("a", "boundary", relation="calls")
+    g.add_edge("a", "b", relation="calls")
+    g.add_edge("b", "a", relation="calls")  # a <-> b mutual calls
+    floors, _ = compute_floors(g)
+    assert floors["a"] == floors["b"] == 1
 
 
 def test_no_boundary_yields_no_floors_not_a_fabricated_layering():
@@ -94,13 +129,15 @@ def test_unreachable_component_has_no_floor_rather_than_zero():
     assert "island" not in floors  # absent, NOT floor 0
 
 
-def test_distance_is_undirected():
-    """A parser CALLED BY a controller still supplies data to it — call
-    direction is who-invokes-whom, not which way data moves."""
+def test_caller_of_the_boundary_is_one_floor_up():
+    """A parser CALLED BY a controller still supplies data to it — floor is
+    measured against call direction (caller = boundary's floor + 1), not
+    along it, since a boundary node's own callees (if any) are not what
+    makes it downstream of anything."""
     g = nx.DiGraph()
     _code(g, "parser", "parse_file()", source_file="app/parser/p.py")
     _code(g, "caller", "controller()", source_file="app/ui/u.py")
-    g.add_edge("caller", "parser", relation="calls")  # edge points AWAY from parser
+    g.add_edge("caller", "parser", relation="calls")  # caller calls parser
     floors, _ = compute_floors(g)
     assert floors["caller"] == 1
 

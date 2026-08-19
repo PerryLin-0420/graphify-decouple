@@ -763,8 +763,8 @@ def decouple_plan(
 
     from graphify.data_floor import class_floor_profile, compute_floors, cross_floor_risk
 
-    # Data-flow floors for the whole graph, computed once (BFS from the I/O
-    # boundary — see graphify.data_floor). Empty when no boundary is
+    # Data-flow floors for the whole graph, computed once (longest directed
+    # path from the I/O boundary — see graphify.data_floor). Empty when no boundary is
     # detectable at all, in which case every entry's floor fields stay
     # absent rather than defaulting to a fabricated layer.
     floors, floor_reasons = compute_floors(G)
@@ -882,17 +882,23 @@ def decouple_plan(
             "pipeline' judgment, and a 2-group split is weak evidence either "
             "way; straddling_callers and max_state_overlap are NOT discounted "
             "by it.",
-            "floor_profile / floor_risk come from graphify.data_floor: BFS "
-            "distance from the system's I/O boundary, where the boundary is "
-            "detected by a NAME heuristic (path tokens + symbol-name stems), "
-            "not by actual I/O analysis — it can miss a boundary hidden "
-            "behind a domain-flavored name and can flag a parse_args() that "
-            "never touches the outside world. Distance is measured on the "
-            "UNDIRECTED graph: a call edge's direction is who-invokes-whom, "
-            "which is not the same as which way data moves. A class with no "
-            "floor_profile was NOT measured (no boundary reachable), which "
-            "is not the same as sitting on a single floor — its "
-            "risk_before carries no cross-floor term either way.",
+            "floor_profile / floor_risk come from graphify.data_floor: the "
+            "LONGEST directed-call-path distance from the system's I/O "
+            "boundary (not the shortest), computed on the graph's strongly-"
+            "connected-component condensation so a genuine call cycle shares "
+            "one floor instead of having no defined longest path. The "
+            "boundary itself is detected by a NAME heuristic (path tokens + "
+            "symbol-name stems), not by actual I/O analysis — it can miss a "
+            "boundary hidden behind a domain-flavored name and can flag a "
+            "parse_args() that never touches the outside world. Floor "
+            "increases walking from the boundary out to its CALLERS (a "
+            "class that calls a floor-0 boundary is floor 1, whatever calls "
+            "that class is floor 2, and so on) — call direction is who-"
+            "invokes-whom, which is not the same as which way data moves, "
+            "but it is the only direction available to measure along. A "
+            "class with no floor_profile was NOT measured (no boundary "
+            "reachable), which is not the same as sitting on a single floor "
+            "— its risk_before carries no cross-floor term either way.",
             "Each proposed group ALSO gets its own floor_profile (attached "
             "once, here, and read — never recomputed — by split_risk_score "
             "and by decouple_3d.py's before/after view). max_group_floor_risk "
