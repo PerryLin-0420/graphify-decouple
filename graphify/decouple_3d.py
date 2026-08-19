@@ -269,7 +269,7 @@ def _page(scene_json: str, title: str, stats: str, has_proposed: bool) -> str:
     <span>crosses floors</span></div>
   <div class="row"><span class="swatch" style="background:#7dd3fc"></span>
     <span>same floor (parallel)</span></div>
-  <h3>Cross-floor regions</h3>
+  <h3>Cross-floor splits</h3>
   <div id="span-list"></div>
   <div id="notes">
     <b>{stats}</b><br><br>
@@ -810,17 +810,43 @@ if (SCENE.regions.some(r => r.floor === null)) {{
   floorList.appendChild(row);
 }}
 
+// A "before" region's own span is ALWAYS 0 now (data_floor's region_of
+// contracts every member of a class/module to one shared floor by
+// construction — see compute_floors_with_provenance's docstring), so
+// filtering on r.spans > 0 here always found nothing after that change.
+// The question this panel exists to answer moved to split time: not "does
+// this class's current members disagree" (they cannot), but "would the
+// GROUPS a recommended split proposes end up on different floors from
+// each other" — exactly what the "after" regions already carry (state
+// === 'after', grouped by the class they'd replace), so no extra data
+// needs plumbing in from the god-node risk detail.
 const spanList = document.getElementById('span-list');
-const spanning = SCENE.regions.filter(r => r.spans > 0).sort((a, b) => b.spans - a.spans);
-if (!spanning.length) {{
-  spanList.innerHTML = '<div class="row muted">None &mdash; every unit sits on one floor.</div>';
+const afterByParent = new Map();
+SCENE.regions.filter(r => r.state === 'after').forEach(r => {{
+  if (!afterByParent.has(r.replaces)) afterByParent.set(r.replaces, []);
+  afterByParent.get(r.replaces).push(r);
+}});
+const splitSpans = [];
+afterByParent.forEach((groups, parentId) => {{
+  const floors = groups.map(g => g.floor).filter(f => f !== null);
+  if (floors.length < 2) return;
+  const lo = Math.min(...floors), hi = Math.max(...floors);
+  if (hi <= lo) return;
+  const parent = regionById.get(parentId);
+  splitSpans.push({{ label: parent ? parent.label : parentId, color: groups[0].color, lo, hi }});
+}});
+splitSpans.sort((a, b) => (b.hi - b.lo) - (a.hi - a.lo));
+if (!splitSpans.length) {{
+  spanList.innerHTML = SCENE.regions.some(r => r.state === 'after')
+    ? '<div class="row muted">None &mdash; every proposed split keeps its groups on one floor.</div>'
+    : '<div class="row muted">No recommended split to check &mdash; toggle "Preview decoupled view" once one exists.</div>';
 }}
-spanning.slice(0, 20).forEach(r => {{
+splitSpans.slice(0, 20).forEach(s => {{
   const row = document.createElement('div');
   row.className = 'row';
-  row.innerHTML = '<span class="swatch" style="background:' + r.color + '"></span>'
-    + '<span>' + r.label + '</span>'
-    + '<span class="muted" style="margin-left:auto">' + r.min_floor + '&ndash;' + r.max_floor + '</span>';
+  row.innerHTML = '<span class="swatch" style="background:' + s.color + '"></span>'
+    + '<span>' + s.label + '</span>'
+    + '<span class="muted" style="margin-left:auto">' + s.lo + '&ndash;' + s.hi + '</span>';
   spanList.appendChild(row);
 }});
 
