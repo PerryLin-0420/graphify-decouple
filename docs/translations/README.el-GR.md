@@ -435,6 +435,7 @@ graphify export callflow-html      # Mermaid architecture/call-flow HTML (auto-r
 /graphify query "what connects auth to the database?"
 /graphify path "UserService" "DatabasePool"
 /graphify explain "RateLimiter"
+graphify god-nodes                                # list the most-connected nodes (architectural hubs)
 
 /graphify add https://arxiv.org/abs/1706.03762   # fetch a paper and add it
 /graphify add <youtube-url>                       # transcribe and add a video
@@ -600,6 +601,23 @@ docker run -p 8080:8080 -v "$(pwd)/graphify-out:/data" graphify \
 
 ---
 
+## Περιορισμοί και όρια
+
+Τι το graphify σκόπιμα **δεν** κάνει, και πού σταματά η κάλυψή του:
+
+- **Δεν είναι μηχανή σημασιολογικής/διανυσματικής αναζήτησης.** Ο γράφος είναι δομικός — κόμβοι και τυποποιημένες ακμές που έχουν επιλυθεί από την πηγή, όχι embeddings. Τα `graphify query`/`path`/`explain` διατρέχουν αυτή τη δομή· δεν μπορούν να αναδείξουν μια σύνδεση που δεν αναπαρίσταται ως ακμή, ακόμα κι αν είναι "σημασιολογικά" σχετική. Δεν υπάρχει εναλλακτική ομοιότητας/πλησιέστερου γείτονα.
+- **Τα έγγραφα, τα PDF, οι εικόνες, και η headless εξαγωγή βίντεο/URL δεν είναι μόνο τοπικά.** Μόνο ο κώδικας (tree-sitter AST) και η μεταγραφή ήχου/βίντεο (faster-whisper) τρέχουν εντελώς offline. Η εξαγωγή εγγράφων/PDF/εικόνων καλεί πάντα ένα LLM — το μοντέλο του AI βοηθού σας μέσω του skill `/graphify`, ή ένα ρυθμισμένο κλειδί API backend για το headless `graphify extract`. Δείτε [Απόρρητο](#απόρρητο) παραπάνω για ακριβώς ποια σημαία ή κλειδί χρειάζεται κάθε διαδρομή.
+- **Ο έλεγχος κοινής κατάστασης του decouple δεν καλύπτει κάθε γλώσσα.** Η C δεν έχει αξιόπιστο σήμα `self`/`this` χωρίς πλήρη συναγωγή τύπων, οπότε εξαιρείται (δείτε τον [πίνακα κάλυψης γλωσσών](#decouple-risk-scored-extract-class-candidates) παραπάνω). Ένας god κόμβος σε μη υποστηριζόμενη γλώσσα, ή του οποίου η πηγή δεν μπορεί να διαβαστεί, επιστρέφει σε βαθμολόγηση μόνο-με-γράφο-κλήσεων (`state_analysis: "skipped"`) αντί για επαληθευμένο έλεγχο κατάστασης.
+- **Το κατώφλι ροής δεδομένων 3D είναι ευρετικό ονόματος, όχι ανάλυση ροής δεδομένων/taint.** Η ανίχνευση ορίου Ε/Ε (I/O) του `data_floor` (parsers, loaders, readers, writers, πελάτες DB/HTTP) ταιριάζει με βάση συμβάσεις ονομασίας (`boundary_reason`)· ένας κόμβος ορίου με ασυνήθιστο όνομα μπορεί να χαθεί, υποτιμώντας πόσο βαθιά βρίσκεται το υπόλοιπο του γράφου.
+- **Οι ετικέτες εμπιστοσύνης είναι η δική του εμπιστοσύνη επίλυσης του graphify, όχι απόλυτη αλήθεια.** Οι ακμές `INFERRED` και `AMBIGUOUS` είναι επιλύσεις βέλτιστης προσπάθειας και μπορεί ακόμα να είναι λανθασμένες, ειδικά για εξαιρετικά δυναμικά ιδιώματα (reflection, dynamic dispatch, metaprogramming) που καμία στατική διέλευση AST δεν μπορεί να επιλύσει πλήρως.
+- **Η οπτικοποίηση HTML και το μέγεθος του γράφου έχουν και τα δύο ένα ανώτατο όριο.** Τα `graph.html` / `DECOUPLE.html` παραλείπουν τη δημιουργία πάνω από 5.000 κόμβους από προεπιλογή (`MAX_NODES_FOR_VIZ`, αυξήστε μέσω `GRAPHIFY_VIZ_NODE_LIMIT`)· το ίδιο το `graph.json` περιορίζεται στα 512 MiB (`GRAPHIFY_MAX_GRAPH_BYTES` για παράκαμψη). Χρησιμοποιήστε `--no-viz` συν `query`/`path`/`explain` για corpora πέρα από οποιοδήποτε από τα δύο όρια.
+- **Η επίγνωση μεταξύ έργων είναι opt-in, όχι αυτόματη.** Το `graphify query` βλέπει μόνο τον ένα γράφο στον οποίο δείχνετε. Ερωτήματα πολλαπλών αποθετηρίων απαιτούν ρητή καταχώριση κάθε έργου στον κοινόχρηστο γράφο πρώτα (`graphify global add`, περιορισμένο σε `GRAPHIFY_MAX_CONTEXTS` μη προεπιλεγμένα contexts ανά διακομιστή MCP) — το graphify ποτέ δεν σαρώνει το μηχάνημά σας για άλλα αποθετήρια από μόνο του.
+- **Η παράλληλη εξαγωγή πολλαπλών agent εξαρτάται από την πλατφόρμα.** Χρειάζεται υποστήριξη από την πλευρά του βοηθού για αποστολή subagents (`multi_agent = true` στο `~/.codex/config.toml` για το Codex, το εργαλείο Agent/Task στο Claude Code/CodeBuddy/Factory Droid/Trae). Τα OpenClaw και Aider προς το παρόν κάνουν εξαγωγή μόνο διαδοχικά.
+- **Ο κοινόχρηστος διακομιστής MCP HTTP συνδέεται μόνο σε loopback από προεπιλογή.** Η πρόσβαση σε αυτόν από άλλο μηχάνημα απαιτεί ρητά `--host 0.0.0.0` **και** `--api-key`· το graphify δεν διαχειρίζεται TLS ή οποιαδήποτε αυθεντικοποίηση πέρα από αυτό το ένα bearer token.
+- **Το PowerShell αναλύει μια αρχική `/` ως διαχωριστικό διαδρομής.** Το `/graphify .` αποτυγχάνει στο Windows PowerShell για αυτόν τον λόγο, όχι λόγω σφάλματος του graphify — χρησιμοποιήστε αντ' αυτού `graphify .`.
+
+---
+
 ## Επίλυση προβλημάτων
 
 **`graphify: command not found` μετά την εγκατάσταση**
@@ -719,6 +737,9 @@ graphify extract ./raw --code-only # index code only — local AST, no API key (
 /graphify path "DigestAuth" "Response"
 /graphify explain "SwinTransformer"
 
+graphify god-nodes                 # list the most-connected nodes (architectural hubs)
+graphify god-nodes --top 20 --json # more results, machine-readable
+
 graphify save-result --question "Q" --answer "A" --nodes Foo Bar --outcome useful   # record how a Q&A turned out (work memory; outcome ∈ useful|dead_end|corrected)
 graphify reflect                   # aggregate graphify-out/memory/ outcomes into reflections/LESSONS.md
 graphify reflect --if-stale        # no-op when LESSONS.md is already newer than every input (cheap to run each session)
@@ -806,6 +827,18 @@ graphify export callflow-html                       # graphify-out/<project>-cal
 graphify export callflow-html --max-sections 8      # cap generated architecture sections
 graphify export callflow-html --output docs/arch.html
 graphify export callflow-html ./some-repo/graphify-out
+
+graphify tree                                       # graphify-out/GRAPH_TREE.html — D3 collapsible-tree view of graph.json
+graphify tree --root ./src --max-children 200 --output docs/tree.html
+
+graphify diagnose multigraph                        # report same-endpoint edge collapse risk in graph.json
+graphify diagnose multigraph --json --max-examples 10
+
+graphify benchmark                                  # measure token reduction vs a naive full-corpus approach
+graphify benchmark graphify-out/graph.json
+
+# git merge driver for graph.json — set up by `graphify hook install`, not run by hand:
+graphify merge-driver <base> <current> <other>
 
 graphify global add graphify-out/graph.json --as myrepo   # register a project graph into ~/.graphify/global-graph.json
 graphify global remove myrepo                         # remove a project from the global graph

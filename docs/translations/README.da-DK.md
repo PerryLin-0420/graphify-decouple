@@ -443,6 +443,7 @@ graphify export callflow-html      # Mermaid architecture/call-flow HTML (auto-r
 /graphify query "what connects auth to the database?"
 /graphify path "UserService" "DatabasePool"
 /graphify explain "RateLimiter"
+graphify god-nodes                                # list the most-connected nodes (architectural hubs)
 
 /graphify add https://arxiv.org/abs/1706.03762   # fetch a paper and add it
 /graphify add <youtube-url>                       # transcribe and add a video
@@ -608,6 +609,23 @@ Disse er kun nødvendige til **headless/CI-udtrækning** (`graphify extract`). N
 
 ---
 
+## Begrænsninger og grænser
+
+Det, graphify bevidst **ikke** gør, og hvor dens dækning stopper:
+
+- **Ikke en semantisk/vektor-søgemaskine.** Grafen er strukturel — noder og typede kanter udledt fra kilden, ikke embeddings. `graphify query`/`path`/`explain` gennemtraverserer den struktur; de kan ikke vise en forbindelse, der ikke er repræsenteret som en kant, selvom den er "semantisk" beslægtet. Der findes ingen similarity-/nærmeste-nabo-fallback.
+- **Dokumenter, PDF'er, billeder og headless video-/URL-udtrækning er ikke rent lokale.** Kun kode (tree-sitter AST) og video-/lydtranskription (faster-whisper) kører helt offline. Udtrækning af dokumenter/PDF'er/billeder kalder altid en LLM — din AI-assistents model via `/graphify`-skillet, eller en konfigureret backend-API-nøgle til headless `graphify extract`. Se [Privatliv](#privatliv) ovenfor for præcis, hvilket flag eller hvilken nøgle hver vej kræver.
+- **Decouples kontrol af delt tilstand dækker ikke alle sprog.** C har intet pålideligt `self`/`this`-signal uden fuld typeinferens, så det er udelukket (se [sprogunderstøttelsestabellen](#decouple-risikoscorede-extract-class-kandidater) ovenfor). En god-node i et ikke-understøttet sprog, eller en hvis kildekode ikke kan læses, falder tilbage på en scoring, der udelukkende bygger på kaldgrafen (`state_analysis: "skipped"`), i stedet for en verificeret tilstandskontrol.
+- **3D-dataflow-gulvet er en navneheuristik, ikke dataflow-/taint-analyse.** `data_floor`s detektion af I/O-grænser (parsere, loaders, læsere, skrivere, DB-/HTTP-klienter) matcher på navnekonventioner (`boundary_reason`); en grænse-node med et ukonventionelt navn kan overses, hvilket underdriver, hvor dybt resten af grafen ligger.
+- **Konfidensmærkater er graphifys egen resolution-konfidens, ikke absolut sandhed.** `INFERRED`- og `AMBIGUOUS`-kanter er best-effort-resolutions og kan stadig være forkerte, især for stærkt dynamiske idiomer (refleksion, runtime-dispatch, metaprogrammering), som ingen statisk AST-gennemgang kan løse fuldstændigt.
+- **HTML-visualisering og grafstørrelse har begge et loft.** `graph.html` / `DECOUPLE.html` springer generering over ved mere end 5.000 noder som standard (`MAX_NODES_FOR_VIZ`, kan hæves via `GRAPHIFY_VIZ_NODE_LIMIT`); `graph.json` selv er begrænset til 512 MiB (`GRAPHIFY_MAX_GRAPH_BYTES` til at overstyre). Brug `--no-viz` sammen med `query`/`path`/`explain` til korpora, der overstiger en af grænserne.
+- **Bevidsthed på tværs af projekter er opt-in, ikke automatisk.** `graphify query` ser kun den ene graf, du peger den mod. Spørgsmål på tværs af flere repositories kræver, at du først eksplicit registrerer hvert projekt i den delte graf (`graphify global add`, begrænset til `GRAPHIFY_MAX_CONTEXTS` ikke-standard-kontekster pr. MCP-server) — graphify scanner aldrig selv din maskine for andre repositories.
+- **Parallel multi-agent-udtrækning afhænger af platformen.** Det kræver assistent-side understøttelse af at starte subagenter (`multi_agent = true` under `~/.codex/config.toml` til Codex, Agent-/Task-værktøjet på Claude Code/CodeBuddy/Factory Droid/Trae). OpenClaw og Aider udtrækker i øjeblikket kun sekventielt.
+- **Den delte MCP-HTTP-server binder som standard kun til loopback.** At nå den fra en anden maskine kræver eksplicit `--host 0.0.0.0` **og** `--api-key`; graphify håndterer hverken TLS eller anden autentificering end den ene bearer-token.
+- **PowerShell fortolker en ledende `/` som en stiseparator.** `/graphify .` fejler derfor på Windows PowerShell, ikke på grund af en fejl i graphify — brug `graphify .` i stedet.
+
+---
+
 ## Fejlfinding
 
 **`graphify: command not found` efter installation**
@@ -727,6 +745,9 @@ graphify extract ./raw --code-only # index code only — local AST, no API key (
 /graphify path "DigestAuth" "Response"
 /graphify explain "SwinTransformer"
 
+graphify god-nodes                 # list the most-connected nodes (architectural hubs)
+graphify god-nodes --top 20 --json # more results, machine-readable
+
 graphify save-result --question "Q" --answer "A" --nodes Foo Bar --outcome useful   # record how a Q&A turned out (work memory; outcome ∈ useful|dead_end|corrected)
 graphify reflect                   # aggregate graphify-out/memory/ outcomes into reflections/LESSONS.md
 graphify reflect --if-stale        # no-op when LESSONS.md is already newer than every input (cheap to run each session)
@@ -814,6 +835,18 @@ graphify export callflow-html                       # graphify-out/<project>-cal
 graphify export callflow-html --max-sections 8      # cap generated architecture sections
 graphify export callflow-html --output docs/arch.html
 graphify export callflow-html ./some-repo/graphify-out
+
+graphify tree                                       # graphify-out/GRAPH_TREE.html — D3 collapsible-tree view of graph.json
+graphify tree --root ./src --max-children 200 --output docs/tree.html
+
+graphify diagnose multigraph                        # report same-endpoint edge collapse risk in graph.json
+graphify diagnose multigraph --json --max-examples 10
+
+graphify benchmark                                  # measure token reduction vs a naive full-corpus approach
+graphify benchmark graphify-out/graph.json
+
+# git merge driver for graph.json — set up by `graphify hook install`, not run by hand:
+graphify merge-driver <base> <current> <other>
 
 graphify global add graphify-out/graph.json --as myrepo   # register a project graph into ~/.graphify/global-graph.json
 graphify global remove myrepo                         # remove a project from the global graph

@@ -445,6 +445,7 @@ graphify export callflow-html      # Mermaid architecture/call-flow HTML (auto-r
 /graphify query "what connects auth to the database?"
 /graphify path "UserService" "DatabasePool"
 /graphify explain "RateLimiter"
+graphify god-nodes                                # list the most-connected nodes (architectural hubs)
 
 /graphify add https://arxiv.org/abs/1706.03762   # fetch a paper and add it
 /graphify add <youtube-url>                       # transcribe and add a video
@@ -610,6 +611,23 @@ Tyto jsou potřeba pouze pro **headless / CI extrakci** (`graphify extract`). P�
 
 ---
 
+## Omezení a hranice použitelnosti
+
+Co graphify záměrně **ne**dělá a kde končí jeho pokrytí:
+
+- **Není to sémantický/vektorový vyhledávací engine.** Graf je strukturální — uzly a typované hrany odvozené ze zdrojového kódu, ne embeddingy. `graphify query`/`path`/`explain` procházejí tuto strukturu; nedokážou odhalit spojení, které není reprezentováno jako hrana, i kdyby bylo "sémanticky" příbuzné. Neexistuje žádný záložní mechanismus založený na podobnosti/nejbližších sousedech.
+- **Dokumentace, PDF, obrázky a headless extrakce videa/URL nejsou čistě lokální.** Plně offline běží pouze kód (AST přes tree-sitter) a přepis audia/videa (faster-whisper). Extrakce dokumentace/PDF/obrázků vždy volá LLM — buď model tvého AI asistenta přes skill `/graphify`, nebo nakonfigurovaný API klíč backendu pro headless `graphify extract`. Přesně to, který přepínač nebo klíč každá cesta potřebuje, najdeš výše v sekci [Soukromí](#soukromí).
+- **Kontrola sdílení stavu v decouple nepokrývá všechny jazyky.** C nemá spolehlivý signál `self`/`this` bez plné inference typů, takže je vyloučeno (viz [tabulka pokrytí jazyků](#decouple-kandidáti-na-extract-class-s-hodnocením-rizika) výše). God node v nepodporovaném jazyce, nebo takový, jehož zdrojový kód nelze přečíst, spadne na skórování pouze podle call grafu (`state_analysis: "skipped"`) místo ověřené kontroly stavu.
+- **3D data-flow floor je heuristika založená na názvech, ne analýza datového toku/taint analýza.** Detekce I/O hranic v `data_floor` (parsery, loadery, čtečky, zapisovače, DB/HTTP klienti) se shoduje podle konvencí pojmenování (`boundary_reason`); hraniční uzel s nekonvenčním názvem může být přehlédnut, čímž se podhodnotí, jak hluboko zbytek grafu skutečně sahá.
+- **Značky spolehlivosti jsou vlastní míra jistoty graphify při rozhodování, ne objektivní pravda.** Hrany `INFERRED` a `AMBIGUOUS` jsou rozhodnutí typu best-effort a stále mohou být chybná, zejména u vysoce dynamických idiomů (reflexe, dispatch za běhu, metaprogramování), které žádný statický průchod AST nedokáže zcela vyřešit.
+- **HTML vizualizace i velikost grafu mají svůj strop.** `graph.html` / `DECOUPLE.html` ve výchozím stavu přeskočí generování nad 5 000 uzly (`MAX_NODES_FOR_VIZ`, lze zvýšit přes `GRAPHIFY_VIZ_NODE_LIMIT`); samotný `graph.json` je omezen na 512 MiB (lze přepsat přes `GRAPHIFY_MAX_GRAPH_BYTES`). Pro korpusy přesahující kterýkoli z těchto limitů použij `--no-viz` spolu s `query`/`path`/`explain`.
+- **Povědomí o více projektech je volitelné, ne automatické.** `graphify query` vidí pouze ten jeden graf, na který ukazuješ. Dotazy napříč více repozitáři vyžadují explicitní registraci každého projektu do sdíleného grafu (`graphify global add`, s limitem `GRAPHIFY_MAX_CONTEXTS` nevýchozích kontextů na MCP server) — graphify nikdy sám neprohledává tvůj počítač kvůli dalším repozitářům.
+- **Paralelní extrakce více agenty závisí na platformě.** Vyžaduje podporu spouštění subagentů na straně asistenta (`multi_agent = true` v `~/.codex/config.toml` pro Codex, nástroj Agent/Task v Claude Code/CodeBuddy/Factory Droid/Trae). OpenClaw a Aider zatím extrahují jen sekvenčně.
+- **Sdílený MCP HTTP server ve výchozím stavu naslouchá pouze na loopbacku.** Přístup z jiného stroje vyžaduje explicitní `--host 0.0.0.0` **a** `--api-key`; graphify neřeší TLS ani žádnou autentizaci nad rámec tohoto jediného bearer tokenu.
+- **PowerShell interpretuje úvodní `/` jako oddělovač cesty.** `/graphify .` proto na Windows PowerShellu selže — nejde o chybu graphify — místo toho použij `graphify .`.
+
+---
+
 ## Řešení potíží
 
 **`graphify: command not found` po instalaci**
@@ -729,6 +747,9 @@ graphify extract ./raw --code-only # index code only — local AST, no API key (
 /graphify path "DigestAuth" "Response"
 /graphify explain "SwinTransformer"
 
+graphify god-nodes                 # list the most-connected nodes (architectural hubs)
+graphify god-nodes --top 20 --json # more results, machine-readable
+
 graphify save-result --question "Q" --answer "A" --nodes Foo Bar --outcome useful   # record how a Q&A turned out (work memory; outcome ∈ useful|dead_end|corrected)
 graphify reflect                   # aggregate graphify-out/memory/ outcomes into reflections/LESSONS.md
 graphify reflect --if-stale        # no-op when LESSONS.md is already newer than every input (cheap to run each session)
@@ -816,6 +837,18 @@ graphify export callflow-html                       # graphify-out/<project>-cal
 graphify export callflow-html --max-sections 8      # cap generated architecture sections
 graphify export callflow-html --output docs/arch.html
 graphify export callflow-html ./some-repo/graphify-out
+
+graphify tree                                       # graphify-out/GRAPH_TREE.html — D3 collapsible-tree view of graph.json
+graphify tree --root ./src --max-children 200 --output docs/tree.html
+
+graphify diagnose multigraph                        # report same-endpoint edge collapse risk in graph.json
+graphify diagnose multigraph --json --max-examples 10
+
+graphify benchmark                                  # measure token reduction vs a naive full-corpus approach
+graphify benchmark graphify-out/graph.json
+
+# git merge driver for graph.json — set up by `graphify hook install`, not run by hand:
+graphify merge-driver <base> <current> <other>
 
 graphify global add graphify-out/graph.json --as myrepo   # register a project graph into ~/.graphify/global-graph.json
 graphify global remove myrepo                         # remove a project from the global graph

@@ -435,6 +435,7 @@ graphify export callflow-html      # Mermaid architecture/call-flow HTML (auto-r
 /graphify query "what connects auth to the database?"
 /graphify path "UserService" "DatabasePool"
 /graphify explain "RateLimiter"
+graphify god-nodes                                # list the most-connected nodes (architectural hubs)
 
 /graphify add https://arxiv.org/abs/1706.03762   # fetch a paper and add it
 /graphify add <youtube-url>                       # transcribe and add a video
@@ -600,6 +601,23 @@ docker run -p 8080:8080 -v "$(pwd)/graphify-out:/data" graphify \
 
 ---
 
+## 제한 사항 및 적용 범위
+
+graphify가 의도적으로 **하지 않는** 것, 그리고 다루는 범위가 어디에서 끝나는지:
+
+- **시맨틱/벡터 검색 엔진이 아닙니다.** 그래프는 구조적입니다 — 노드와 타입이 지정된 엣지는 임베딩이 아니라 소스에서 해석된 것입니다. `graphify query`/`path`/`explain`은 그 구조를 탐색할 뿐이므로, 엣지로 표현되지 않은 연결은 "의미적으로" 관련이 있더라도 찾아낼 수 없습니다. 유사도/최근접 이웃 기반의 대체 수단은 없습니다.
+- **문서, PDF, 이미지, 그리고 헤드리스 비디오/URL 추출은 로컬 전용이 아닙니다.** 완전히 오프라인으로 실행되는 것은 코드(tree-sitter AST)와 오디오/비디오 전사(faster-whisper)뿐입니다. 문서/PDF/이미지 추출은 항상 LLM을 호출합니다 — `/graphify` 스킬을 통해 AI 어시스턴트의 모델을 사용하거나, 헤드리스 `graphify extract`에서는 설정된 백엔드 API 키를 사용합니다. 각 경로에 어떤 플래그나 키가 필요한지는 위의 [개인정보 보호](#개인정보-보호)를 참고하세요.
+- **decouple의 상태 공유 검사는 모든 언어를 다루지 않습니다.** C는 완전한 타입 추론 없이는 신뢰할 수 있는 `self`/`this` 신호가 없어 제외됩니다(위의 [언어 지원 표](#decouple-risk-scored-extract-class-candidates) 참고). 지원되지 않는 언어의 god 노드, 또는 소스를 읽을 수 없는 노드는 검증된 상태 검사 대신 호출 그래프에만 기반한 점수(`state_analysis: "skipped"`)로 대체됩니다.
+- **3D 데이터 흐름 층(floor)은 이름 기반 휴리스틱이며, 데이터 흐름/테인트 분석이 아닙니다.** `data_floor`의 I/O 경계 감지(파서, 로더, 리더, 라이터, DB/HTTP 클라이언트)는 명명 규칙(`boundary_reason`)에 따라 매칭됩니다. 관례를 따르지 않는 이름의 경계 노드는 누락될 수 있으며, 이는 그래프의 나머지 부분이 실제로 얼마나 깊은지를 과소평가하게 만듭니다.
+- **신뢰도 태그는 graphify 자체의 해석 신뢰도이지, 절대적인 사실이 아닙니다.** `INFERRED`와 `AMBIGUOUS` 엣지는 최선을 다한 해석 결과이며 여전히 틀릴 수 있습니다. 특히 정적 AST 분석으로는 완전히 해석할 수 없는 매우 동적인 관용구(리플렉션, 런타임 디스패치, 메타프로그래밍)에서 더욱 그렇습니다.
+- **HTML 시각화와 그래프 크기 모두 상한이 있습니다.** `graph.html` / `DECOUPLE.html`은 기본적으로 노드가 5,000개를 넘으면 생성을 건너뜁니다(`MAX_NODES_FOR_VIZ`, `GRAPHIFY_VIZ_NODE_LIMIT`으로 상향 가능). `graph.json` 자체는 512 MiB로 제한됩니다(`GRAPHIFY_MAX_GRAPH_BYTES`로 재정의 가능). 두 한계를 넘는 코퍼스에는 `--no-viz`와 `query`/`path`/`explain`을 함께 사용하세요.
+- **프로젝트 간 인식은 자동이 아니라 옵트인입니다.** `graphify query`는 지정한 그래프 하나만 볼 수 있습니다. 여러 저장소에 걸친 질문을 하려면 먼저 각 프로젝트를 공유 그래프에 명시적으로 등록해야 합니다(`graphify global add`, MCP 서버당 기본값이 아닌 컨텍스트는 `GRAPHIFY_MAX_CONTEXTS`개로 제한) — graphify는 스스로 여러분의 컴퓨터에서 다른 저장소를 스캔하지 않습니다.
+- **병렬 멀티 에이전트 추출은 플랫폼에 따라 다릅니다.** 서브 에이전트를 생성할 수 있는 어시스턴트 측 지원이 필요합니다(Codex는 `~/.codex/config.toml`의 `multi_agent = true`, Claude Code/CodeBuddy/Factory Droid/Trae는 Agent/Task 도구). OpenClaw와 Aider는 현재 순차적으로만 추출합니다.
+- **공유 MCP HTTP 서버는 기본적으로 loopback에만 바인딩됩니다.** 다른 머신에서 접근하려면 `--host 0.0.0.0`**과** `--api-key`를 명시적으로 함께 설정해야 합니다. graphify는 이 단일 bearer 토큰 외에는 TLS나 다른 인증을 관리하지 않습니다.
+- **PowerShell은 앞의 `/`를 경로 구분자로 해석합니다.** 이 때문에 `/graphify .`는 Windows PowerShell에서 실패합니다. graphify의 버그가 아니라, 대신 `graphify .`를 사용하세요.
+
+---
+
 ## 문제 해결
 
 **설치 후 `graphify: command not found`**
@@ -719,6 +737,9 @@ graphify extract ./raw --code-only # index code only — local AST, no API key (
 /graphify path "DigestAuth" "Response"
 /graphify explain "SwinTransformer"
 
+graphify god-nodes                 # list the most-connected nodes (architectural hubs)
+graphify god-nodes --top 20 --json # more results, machine-readable
+
 graphify save-result --question "Q" --answer "A" --nodes Foo Bar --outcome useful   # record how a Q&A turned out (work memory; outcome ∈ useful|dead_end|corrected)
 graphify reflect                   # aggregate graphify-out/memory/ outcomes into reflections/LESSONS.md
 graphify reflect --if-stale        # no-op when LESSONS.md is already newer than every input (cheap to run each session)
@@ -806,6 +827,18 @@ graphify export callflow-html                       # graphify-out/<project>-cal
 graphify export callflow-html --max-sections 8      # cap generated architecture sections
 graphify export callflow-html --output docs/arch.html
 graphify export callflow-html ./some-repo/graphify-out
+
+graphify tree                                       # graphify-out/GRAPH_TREE.html — D3 collapsible-tree view of graph.json
+graphify tree --root ./src --max-children 200 --output docs/tree.html
+
+graphify diagnose multigraph                        # report same-endpoint edge collapse risk in graph.json
+graphify diagnose multigraph --json --max-examples 10
+
+graphify benchmark                                  # measure token reduction vs a naive full-corpus approach
+graphify benchmark graphify-out/graph.json
+
+# git merge driver for graph.json — set up by `graphify hook install`, not run by hand:
+graphify merge-driver <base> <current> <other>
 
 graphify global add graphify-out/graph.json --as myrepo   # register a project graph into ~/.graphify/global-graph.json
 graphify global remove myrepo                         # remove a project from the global graph

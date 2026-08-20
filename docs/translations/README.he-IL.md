@@ -445,6 +445,7 @@ graphify export callflow-html      # Mermaid architecture/call-flow HTML (auto-r
 /graphify query "what connects auth to the database?"
 /graphify path "UserService" "DatabasePool"
 /graphify explain "RateLimiter"
+graphify god-nodes                                # list the most-connected nodes (architectural hubs)
 
 /graphify add https://arxiv.org/abs/1706.03762   # fetch a paper and add it
 /graphify add <youtube-url>                       # transcribe and add a video
@@ -610,6 +611,23 @@ docker run -p 8080:8080 -v "$(pwd)/graphify-out:/data" graphify \
 
 ---
 
+## מגבלות וגבולות
+
+מה ש-graphify במכוון **לא** עושה, והיכן הכיסוי שלו נעצר:
+
+- **לא מנוע חיפוש סמנטי/וקטורי.** הגרף הוא מבני — צמתים וקשתות מסוגים שנפתרו מהמקור, לא embeddings. ‏`graphify query`/`path`/`explain` עוברים על המבנה הזה; הם לא יכולים לחשוף קשר שלא מיוצג כקשת, גם אם הוא "סמנטית" קשור. אין נפילה חזרה (fallback) של דמיון/שכן-קרוב.
+- **מסמכים, PDF, תמונות, וחילוץ headless של וידאו/URL אינם מקומיים בלבד.** רק קוד (‏tree-sitter AST) ותמלול אודיו/וידאו (‏faster-whisper) רצים לגמרי במצב לא מקוון. חילוץ מסמכים/PDF/תמונות תמיד קורא ל-LLM — המודל של עוזר ה-AI שלכם דרך ה-skill ‏`/graphify`, או מפתח API של backend מוגדר עבור `graphify extract` ב-headless. ראו [פרטיות](#פרטיות) למעלה לגבי איזה דגל או מפתח בדיוק כל נתיב צריך.
+- **בדיקת שיתוף ה-state ב-decouple לא מכסה כל שפה.** ל-C אין אות `self`/`this` אמין בלי הסקת טיפוסים מלאה, ולכן היא מוחרגת (ראו את [טבלת כיסוי השפות](#decouple-מועמדי-extract-class-מדורגי-סיכון) למעלה). צומת god בשפה שאינה נתמכת, או כזה שלא ניתן לקרוא את המקור שלו, נופל חזרה לציון מבוסס call graph בלבד (`state_analysis: "skipped"`) במקום בדיקת state מאומתת.
+- **רצפת זרימת הנתונים בתלת-ממד היא היוריסטיקת שמות, לא ניתוח זרימת נתונים/taint.** זיהוי גבול ה-I/O ב-`data_floor` (parsers, loaders, readers, writers, לקוחות DB/HTTP) מתבסס על התאמת מוסכמות שמות (`boundary_reason`); צומת גבול עם שם לא שגרתי עלול להיפספס, מה שממעיט בעומק שבו שאר הגרף באמת נמצא.
+- **תגי ודאות הם רמת הביטחון של graphify עצמה, לא אמת מוחלטת.** קשתות `INFERRED` ו-`AMBIGUOUS` הן פתרונות של מיטב המאמץ ועדיין יכולות לטעות, במיוחד עבור ניבים דינמיים מאוד (reflection, dispatch בזמן ריצה, מטא-תכנות) שאף מעבר AST סטטי לא יכול לפתור באופן מלא.
+- **לוויזואליזציית HTML ולגודל הגרף יש שני תקרות.** ‏`graph.html` / `DECOUPLE.html` מדלגים על היצירה מעל 5,000 צמתים כברירת מחדל (`MAX_NODES_FOR_VIZ`, הגדילו דרך `GRAPHIFY_VIZ_NODE_LIMIT`); ‏`graph.json` עצמו מוגבל ל-512 MiB (`GRAPHIFY_MAX_GRAPH_BYTES` לעקיפה). השתמשו ב-`--no-viz` יחד עם `query`/`path`/`explain` עבור קורפוסים מעבר לאחת מהמגבלות.
+- **מודעות חוצת-פרויקטים היא opt-in, לא אוטומטית.** ‏`graphify query` רואה רק את הגרף היחיד שאליו הפניתם אותו. שאלות רב-מאגריות דורשות רישום מפורש של כל פרויקט לגרף המשותף קודם (`graphify global add`, מוגבל ל-`GRAPHIFY_MAX_CONTEXTS` הקשרים שאינם ברירת מחדל לכל שרת MCP) — graphify לעולם לא סורק את המחשב שלכם לאיתור מאגרים אחרים מיוזמתו.
+- **חילוץ מקבילי רב-סוכנים תלוי בפלטפורמה.** הוא דורש תמיכה מצד העוזר בשיגור תת-סוכנים (`multi_agent = true` ב-`~/.codex/config.toml` עבור Codex, כלי ה-Agent/Task ב-Claude Code/CodeBuddy/Factory Droid/Trae). ‏OpenClaw ו-Aider כרגע מחלצים רק באופן סדרתי.
+- **שרת ה-MCP HTTP המשותף נקשר כברירת מחדל ל-loopback בלבד.** גישה אליו ממחשב אחר דורשת `--host 0.0.0.0` מפורש **וגם** `--api-key`; graphify לא מנהל TLS או כל אימות מעבר לאותו bearer token יחיד.
+- **‏PowerShell מפרש `/` מוביל כמפריד נתיב.** ‏`/graphify .` נכשל ב-Windows PowerShell מהסיבה הזו, לא באג ב-graphify — השתמשו ב-`graphify .` במקום.
+
+---
+
 ## פתרון תקלות
 
 **‏`graphify: command not found` אחרי ההתקנה**
@@ -729,6 +747,9 @@ graphify extract ./raw --code-only # index code only — local AST, no API key (
 /graphify path "DigestAuth" "Response"
 /graphify explain "SwinTransformer"
 
+graphify god-nodes                 # list the most-connected nodes (architectural hubs)
+graphify god-nodes --top 20 --json # more results, machine-readable
+
 graphify save-result --question "Q" --answer "A" --nodes Foo Bar --outcome useful   # record how a Q&A turned out (work memory; outcome ∈ useful|dead_end|corrected)
 graphify reflect                   # aggregate graphify-out/memory/ outcomes into reflections/LESSONS.md
 graphify reflect --if-stale        # no-op when LESSONS.md is already newer than every input (cheap to run each session)
@@ -816,6 +837,18 @@ graphify export callflow-html                       # graphify-out/<project>-cal
 graphify export callflow-html --max-sections 8      # cap generated architecture sections
 graphify export callflow-html --output docs/arch.html
 graphify export callflow-html ./some-repo/graphify-out
+
+graphify tree                                       # graphify-out/GRAPH_TREE.html — D3 collapsible-tree view of graph.json
+graphify tree --root ./src --max-children 200 --output docs/tree.html
+
+graphify diagnose multigraph                        # report same-endpoint edge collapse risk in graph.json
+graphify diagnose multigraph --json --max-examples 10
+
+graphify benchmark                                  # measure token reduction vs a naive full-corpus approach
+graphify benchmark graphify-out/graph.json
+
+# git merge driver for graph.json — set up by `graphify hook install`, not run by hand:
+graphify merge-driver <base> <current> <other>
 
 graphify global add graphify-out/graph.json --as myrepo   # register a project graph into ~/.graphify/global-graph.json
 graphify global remove myrepo                         # remove a project from the global graph

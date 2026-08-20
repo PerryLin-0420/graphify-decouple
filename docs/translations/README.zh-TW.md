@@ -444,6 +444,7 @@ graphify export callflow-html      # Mermaid architecture/call-flow HTML (auto-r
 /graphify query "what connects auth to the database?"
 /graphify path "UserService" "DatabasePool"
 /graphify explain "RateLimiter"
+graphify god-nodes                                # list the most-connected nodes (architectural hubs)
 
 /graphify add https://arxiv.org/abs/1706.03762   # fetch a paper and add it
 /graphify add <youtube-url>                       # transcribe and add a video
@@ -609,6 +610,23 @@ docker run -p 8080:8080 -v "$(pwd)/graphify-out:/data" graphify \
 
 ---
 
+## 限制與邊界
+
+graphify 刻意**不**做的事,以及它的涵蓋範圍止於何處:
+
+- **不是語意/向量搜尋引擎。** 這個圖譜是結構化的 — 節點與具型別的邊都是從原始碼解析而來,而不是嵌入向量(embeddings)。`graphify query`/`path`/`explain` 只能在這個結構上做遍歷;如果某種關聯沒有被表示成一條邊,即使它在「語意」上有關聯,也無法被找出來。這裡沒有相似度/最近鄰的備援機制。
+- **文件、PDF、圖片,以及無介面模式下的影片/URL 擷取,並非完全在地端執行。** 只有程式碼(tree-sitter AST)與音訊/影片轉錄(faster-whisper)才能完全離線執行。擷取文件/PDF/圖片一律需要呼叫 LLM — 透過 `/graphify` 技能使用你的 AI 助手的模型,或是在無介面的 `graphify extract` 中設定後端 API 金鑰。每種路徑各自需要哪個 flag 或金鑰,詳見上方的[隱私](#隱私)。
+- **decouple 的狀態共享檢查並未涵蓋所有語言。** C 語言在沒有完整型別推斷的情況下,沒有可靠的 `self`/`this` 訊號,因此被排除在外(詳見上方的[語言涵蓋範圍表](#decouple-根據風險評分的-extract-class-候選方案))。位於不受支援語言中的神級節點,或原始碼無法讀取的節點,會退回為僅依據呼叫圖的評分(`state_analysis: "skipped"`),而不是經過驗證的狀態檢查。
+- **3D 資料流層級(floor)是一種命名啟發式方法,而不是資料流/污染(taint)分析。** `data_floor` 的 I/O 邊界偵測(解析器、載入器、讀取器、寫入器、資料庫/HTTP 用戶端)是依命名慣例來比對的(`boundary_reason`);命名不符合慣例的邊界節點可能會被漏掉,導致低估圖譜其餘部分實際的深度。
+- **信心標記是 graphify 自身的解析信心程度,並非絕對事實。** `INFERRED` 與 `AMBIGUOUS` 的邊都是盡力而為的解析結果,仍然可能出錯,尤其是在高度動態的寫法(反射、執行期分派、metaprogramming)下,任何靜態 AST 分析都無法完全解析這些情況。
+- **HTML 視覺化與圖譜大小都有上限。** `graph.html` / `DECOUPLE.html` 預設在節點數超過 5,000 時會跳過產生(`MAX_NODES_FOR_VIZ`,可透過 `GRAPHIFY_VIZ_NODE_LIMIT` 調高);`graph.json` 本身的大小上限是 512 MiB(可透過 `GRAPHIFY_MAX_GRAPH_BYTES` 覆寫)。對於超過這兩個上限的語料庫,請改用 `--no-viz` 搭配 `query`/`path`/`explain`。
+- **跨專案感知是選擇性開啟的,而非自動的。** `graphify query` 只看得到你指定的那一個圖譜。跨 repository 的問題,需要先把每個專案明確註冊進共享圖譜(`graphify global add`,每個 MCP server 最多允許 `GRAPHIFY_MAX_CONTEXTS` 個非預設語料庫)— graphify 不會自行掃描你機器上的其他 repository。
+- **平行多代理擷取取決於所使用的平台。** 它需要助手端支援產生子代理(對 Codex 而言是 `~/.codex/config.toml` 中的 `multi_agent = true`,對 Claude Code/CodeBuddy/Factory Droid/Trae 而言則是 Agent/Task 工具)。OpenClaw 與 Aider 目前只能依序擷取。
+- **共用的 MCP HTTP server 預設只綁定本機存取(loopback-only)。** 要從另一台機器連線,需要明確同時設定 `--host 0.0.0.0` **和** `--api-key`;除了這一個 bearer token 之外,graphify 不會管理 TLS 或其他任何身分驗證機制。
+- **PowerShell 會把開頭的 `/` 解析成路徑分隔符號。** `/graphify .` 在 Windows PowerShell 下會因此失敗,這不是 graphify 的 bug — 請改用 `graphify .`。
+
+---
+
 ## 疑難排解
 
 **安裝完後出現 `graphify: command not found`**
@@ -728,6 +746,9 @@ graphify extract ./raw --code-only # index code only — local AST, no API key (
 /graphify path "DigestAuth" "Response"
 /graphify explain "SwinTransformer"
 
+graphify god-nodes                 # list the most-connected nodes (architectural hubs)
+graphify god-nodes --top 20 --json # more results, machine-readable
+
 graphify save-result --question "Q" --answer "A" --nodes Foo Bar --outcome useful   # record how a Q&A turned out (work memory; outcome ∈ useful|dead_end|corrected)
 graphify reflect                   # aggregate graphify-out/memory/ outcomes into reflections/LESSONS.md
 graphify reflect --if-stale        # no-op when LESSONS.md is already newer than every input (cheap to run each session)
@@ -815,6 +836,18 @@ graphify export callflow-html                       # graphify-out/<project>-cal
 graphify export callflow-html --max-sections 8      # cap generated architecture sections
 graphify export callflow-html --output docs/arch.html
 graphify export callflow-html ./some-repo/graphify-out
+
+graphify tree                                       # graphify-out/GRAPH_TREE.html — D3 collapsible-tree view of graph.json
+graphify tree --root ./src --max-children 200 --output docs/tree.html
+
+graphify diagnose multigraph                        # report same-endpoint edge collapse risk in graph.json
+graphify diagnose multigraph --json --max-examples 10
+
+graphify benchmark                                  # measure token reduction vs a naive full-corpus approach
+graphify benchmark graphify-out/graph.json
+
+# git merge driver for graph.json — set up by `graphify hook install`, not run by hand:
+graphify merge-driver <base> <current> <other>
 
 graphify global add graphify-out/graph.json --as myrepo   # register a project graph into ~/.graphify/global-graph.json
 graphify global remove myrepo                         # remove a project from the global graph

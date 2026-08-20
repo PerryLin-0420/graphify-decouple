@@ -435,6 +435,7 @@ graphify export callflow-html      # Mermaid architecture/call-flow HTML (auto-r
 /graphify query "what connects auth to the database?"
 /graphify path "UserService" "DatabasePool"
 /graphify explain "RateLimiter"
+graphify god-nodes                                # list the most-connected nodes (architectural hubs)
 
 /graphify add https://arxiv.org/abs/1706.03762   # fetch a paper and add it
 /graphify add <youtube-url>                       # transcribe and add a video
@@ -600,6 +601,23 @@ docker run -p 8080:8080 -v "$(pwd)/graphify-out:/data" graphify \
 
 ---
 
+## सीमाएँ और दायरा
+
+graphify जानबूझकर क्या **नहीं** करता, और उसका कवरेज कहाँ ख़त्म होता है:
+
+- **यह कोई सिमैंटिक/वेक्टर सर्च इंजन नहीं है।** ग्राफ़ स्ट्रक्चरल है — नोड्स और टाइप्ड एजेज़ जो सोर्स से रिज़ॉल्व किए गए हैं, न कि embeddings। `graphify query`/`path`/`explain` इसी स्ट्रक्चर पर चलते हैं; वे किसी ऐसे कनेक्शन को सामने नहीं ला सकते जो एज के रूप में मौजूद नहीं है, भले ही वह "सिमैंटिकली" जुड़ा हो। कोई सिमिलैरिटी/नियरेस्ट-नेबर फ़ॉलबैक नहीं है।
+- **दस्तावेज़, PDF, इमेजेज़, और headless वीडियो/URL निष्कर्षण पूरी तरह लोकल नहीं हैं।** सिर्फ़ कोड (tree-sitter AST) और ऑडियो/वीडियो ट्रांसक्रिप्शन (faster-whisper) पूरी तरह ऑफ़लाइन चलते हैं। दस्तावेज़/PDF/इमेज निकालने के लिए हमेशा एक LLM कॉल होती है — `/graphify` स्किल के ज़रिए आपके AI असिस्टेंट का मॉडल, या headless `graphify extract` के लिए कॉन्फ़िगर किया गया बैकएंड API key। हर रास्ते को ठीक कौन-सा फ़्लैग या key चाहिए, इसके लिए ऊपर [गोपनीयता](#गोपनीयता) देखें।
+- **decouple की state-sharing जाँच हर भाषा को कवर नहीं करती।** C के पास पूर्ण टाइप इनफ़रेंस के बिना कोई भरोसेमंद `self`/`this` संकेत नहीं है, इसलिए इसे बाहर रखा गया है (ऊपर [भाषा कवरेज टेबल](#decouple-risk-scored-extract-class-candidates) देखें)। किसी असमर्थित भाषा में god नोड, या जिसका सोर्स पढ़ा नहीं जा सकता, वेरिफ़ाइड स्टेट जाँच के बजाय सिर्फ़ कॉल-ग्राफ़ पर आधारित स्कोरिंग पर गिर जाता है (`state_analysis: "skipped"`)।
+- **3D डेटा-फ़्लो फ़्लोर एक नाम-आधारित ह्यूरिस्टिक है, डेटाफ़्लो/टेंट एनालिसिस नहीं।** `data_floor` की I/O-बाउंड्री डिटेक्शन (parsers, loaders, readers, writers, DB/HTTP क्लाइंट्स) नामकरण परंपराओं (`boundary_reason`) से मैच करती है; असामान्य नाम वाला कोई बाउंड्री नोड छूट सकता है, जिससे बाक़ी ग्राफ़ की असल गहराई कम आँकी जाती है।
+- **कॉन्फ़िडेंस टैग्स graphify का अपना रिज़ॉल्यूशन-भरोसा हैं, कोई परम सत्य नहीं।** `INFERRED` और `AMBIGUOUS` एजेज़ बेस्ट-एफ़र्ट रिज़ॉल्यूशंस हैं और फिर भी ग़लत हो सकते हैं, ख़ासकर बहुत डायनामिक इडियम्स (reflection, रनटाइम डिस्पैच, मेटाप्रोग्रामिंग) के लिए जिन्हें कोई भी स्टैटिक AST पास पूरी तरह हल नहीं कर सकता।
+- **HTML विज़ुअलाइज़ेशन और ग्राफ़ साइज़, दोनों की एक सीमा है।** `graph.html` / `DECOUPLE.html` डिफ़ॉल्ट रूप से 5,000 नोड्स से ऊपर जनरेशन छोड़ देते हैं (`MAX_NODES_FOR_VIZ`, `GRAPHIFY_VIZ_NODE_LIMIT` से बढ़ाएँ); `graph.json` ख़ुद 512 MiB पर सीमित है (`GRAPHIFY_MAX_GRAPH_BYTES` से ओवरराइड करें)। किसी भी सीमा से आगे के कॉर्पस के लिए `--no-viz` के साथ `query`/`path`/`explain` इस्तेमाल करें।
+- **क्रॉस-प्रोजेक्ट अवेयरनेस opt-in है, ऑटोमैटिक नहीं।** `graphify query` सिर्फ़ वही एक ग्राफ़ देखता है जिसकी ओर आप उसे पॉइंट करते हैं। मल्टी-रिपॉज़िटरी सवालों के लिए पहले हर प्रोजेक्ट को शेयर्ड ग्राफ़ में स्पष्ट रूप से रजिस्टर करना ज़रूरी है (`graphify global add`, प्रति MCP सर्वर `GRAPHIFY_MAX_CONTEXTS` non-default कॉन्टेक्स्ट्स तक सीमित) — graphify अपने आप कभी भी आपकी मशीन को दूसरी रिपॉज़िटरीज़ के लिए स्कैन नहीं करता।
+- **पैरेलल मल्टी-एजेंट एक्सट्रैक्शन प्लेटफ़ॉर्म पर निर्भर करता है।** इसके लिए सब-एजेंट्स को स्पॉन करने के लिए असिस्टेंट-साइड सपोर्ट चाहिए (`~/.codex/config.toml` में Codex के लिए `multi_agent = true`, Claude Code/CodeBuddy/Factory Droid/Trae पर Agent/Task टूल)। OpenClaw और Aider फ़िलहाल केवल सीक्वेंशियली एक्सट्रैक्ट करते हैं।
+- **शेयर्ड MCP HTTP सर्वर डिफ़ॉल्ट रूप से केवल loopback से बाइंड होता है।** किसी दूसरी मशीन से इसे एक्सेस करने के लिए स्पष्ट रूप से `--host 0.0.0.0` **और** `--api-key` दोनों चाहिए; graphify TLS या उस एक bearer token के अलावा किसी भी ऑथ को मैनेज नहीं करता।
+- **PowerShell आगे लगे `/` को पाथ सेपरेटर के रूप में पार्स करता है।** इसी वजह से `/graphify .` Windows PowerShell पर फ़ेल होता है, यह graphify का बग नहीं है — इसके बजाय `graphify .` इस्तेमाल करें।
+
+---
+
 ## समस्या निवारण
 
 **इंस्टॉल के बाद `graphify: command not found`**
@@ -719,6 +737,9 @@ graphify extract ./raw --code-only # index code only — local AST, no API key (
 /graphify path "DigestAuth" "Response"
 /graphify explain "SwinTransformer"
 
+graphify god-nodes                 # list the most-connected nodes (architectural hubs)
+graphify god-nodes --top 20 --json # more results, machine-readable
+
 graphify save-result --question "Q" --answer "A" --nodes Foo Bar --outcome useful   # record how a Q&A turned out (work memory; outcome ∈ useful|dead_end|corrected)
 graphify reflect                   # aggregate graphify-out/memory/ outcomes into reflections/LESSONS.md
 graphify reflect --if-stale        # no-op when LESSONS.md is already newer than every input (cheap to run each session)
@@ -806,6 +827,18 @@ graphify export callflow-html                       # graphify-out/<project>-cal
 graphify export callflow-html --max-sections 8      # cap generated architecture sections
 graphify export callflow-html --output docs/arch.html
 graphify export callflow-html ./some-repo/graphify-out
+
+graphify tree                                       # graphify-out/GRAPH_TREE.html — D3 collapsible-tree view of graph.json
+graphify tree --root ./src --max-children 200 --output docs/tree.html
+
+graphify diagnose multigraph                        # report same-endpoint edge collapse risk in graph.json
+graphify diagnose multigraph --json --max-examples 10
+
+graphify benchmark                                  # measure token reduction vs a naive full-corpus approach
+graphify benchmark graphify-out/graph.json
+
+# git merge driver for graph.json — set up by `graphify hook install`, not run by hand:
+graphify merge-driver <base> <current> <other>
 
 graphify global add graphify-out/graph.json --as myrepo   # register a project graph into ~/.graphify/global-graph.json
 graphify global remove myrepo                         # remove a project from the global graph

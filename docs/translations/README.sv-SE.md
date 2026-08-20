@@ -444,6 +444,7 @@ graphify export callflow-html      # Mermaid architecture/call-flow HTML (auto-r
 /graphify query "what connects auth to the database?"
 /graphify path "UserService" "DatabasePool"
 /graphify explain "RateLimiter"
+graphify god-nodes                                # list the most-connected nodes (architectural hubs)
 
 /graphify add https://arxiv.org/abs/1706.03762   # fetch a paper and add it
 /graphify add <youtube-url>                       # transcribe and add a video
@@ -609,6 +610,23 @@ Dessa behövs bara för **huvudlös/CI-extraktion** (`graphify extract`). När d
 
 ---
 
+## Begränsningar och gränser
+
+Vad graphify medvetet **inte** gör, och var dess täckning tar slut:
+
+- **Inte en semantisk/vektorbaserad sökmotor.** Grafen är strukturell — noder och typade kanter härledda från källkoden, inte embeddings. `graphify query`/`path`/`explain` navigerar den strukturen; de kan inte visa en koppling som inte finns representerad som en kant, även om den är "semantiskt" besläktad. Det finns ingen likhets-/närmaste-granne-fallback.
+- **Dokument, PDF-filer, bilder och huvudlös video-/URL-extraktion är inte enbart lokala.** Bara kod (tree-sitter AST) och video-/ljudtranskribering (faster-whisper) körs helt offline. Att extrahera dokument/PDF-filer/bilder anropar alltid en LLM — din AI-assistents modell via `/graphify`-skillen, eller en konfigurerad backend-API-nyckel för huvudlös `graphify extract`. Se [Integritet](#integritet) ovan för exakt vilken flagga eller nyckel varje väg behöver.
+- **Decouples state-delningskontroll täcker inte alla språk.** C saknar en tillförlitlig `self`/`this`-signal utan fullständig typinferens, så det är exkluderat (se [språkstödstabellen](#decouple-riskbedömda-extract-class-kandidater) ovan). En god-nod på ett språk som inte stöds, eller vars källkod inte kan läsas, faller tillbaka på poängsättning enbart via anropsgrafen (`state_analysis: "skipped"`) istället för en verifierad state-kontroll.
+- **3D-dataflödesgolvet är en namnheuristik, inte dataflödes-/taint-analys.** `data_floor`s upptäckt av I/O-gränser (parsers, loaders, readers, writers, DB-/HTTP-klienter) matchar mot namnkonventioner (`boundary_reason`); en gränsnod med ett okonventionellt namn kan missas, vilket underskattar hur djupt resten av grafen sitter.
+- **Konfidensmärkningar är graphifys egen upplösningskonfidens, inte absolut sanning.** `INFERRED`- och `AMBIGUOUS`-kanter är best-effort-upplösningar och kan fortfarande vara fel, särskilt för starkt dynamiska idiom (reflektion, runtime-dispatch, metaprogrammering) som ingen statisk AST-genomgång helt kan lösa upp.
+- **HTML-visualisering och grafstorlek har båda ett tak.** `graph.html` / `DECOUPLE.html` hoppar över generering ovanför 5 000 noder som standard (`MAX_NODES_FOR_VIZ`, höjs via `GRAPHIFY_VIZ_NODE_LIMIT`); `graph.json` i sig är begränsad till 512 MiB (`GRAPHIFY_MAX_GRAPH_BYTES` för att åsidosätta). Använd `--no-viz` tillsammans med `query`/`path`/`explain` för korpusar som överskrider någon av gränserna.
+- **Medvetenhet mellan projekt är opt-in, inte automatisk.** `graphify query` ser bara den ena graf du pekar den mot. Frågor över flera repon kräver att du först explicit registrerar varje projekt i den delade grafen (`graphify global add`, begränsat till `GRAPHIFY_MAX_CONTEXTS` icke-standardkontexter per MCP-server) — graphify skannar aldrig din maskin efter andra repon på egen hand.
+- **Parallell multiagent-extraktion beror på plattformen.** Den kräver assistentstöd för att starta subagenter (`multi_agent = true` under `~/.codex/config.toml` för Codex, Agent/Task-verktyget på Claude Code/CodeBuddy/Factory Droid/Trae). OpenClaw och Aider extraherar för närvarande bara sekventiellt.
+- **Den delade MCP-HTTP-servern binder som standard bara till loopback.** Att nå den från en annan maskin kräver explicit `--host 0.0.0.0` **och** `--api-key`; graphify hanterar ingen TLS eller annan autentisering utöver den enda bearer-token.
+- **PowerShell tolkar ett inledande `/` som en sökvägsseparator.** `/graphify .` misslyckas därför på Windows PowerShell, inte på grund av en bugg i graphify — använd `graphify .` istället.
+
+---
+
 ## Felsökning
 
 **`graphify: command not found` efter installation**
@@ -728,6 +746,9 @@ graphify extract ./raw --code-only # index code only — local AST, no API key (
 /graphify path "DigestAuth" "Response"
 /graphify explain "SwinTransformer"
 
+graphify god-nodes                 # list the most-connected nodes (architectural hubs)
+graphify god-nodes --top 20 --json # more results, machine-readable
+
 graphify save-result --question "Q" --answer "A" --nodes Foo Bar --outcome useful   # record how a Q&A turned out (work memory; outcome ∈ useful|dead_end|corrected)
 graphify reflect                   # aggregate graphify-out/memory/ outcomes into reflections/LESSONS.md
 graphify reflect --if-stale        # no-op when LESSONS.md is already newer than every input (cheap to run each session)
@@ -815,6 +836,18 @@ graphify export callflow-html                       # graphify-out/<project>-cal
 graphify export callflow-html --max-sections 8      # cap generated architecture sections
 graphify export callflow-html --output docs/arch.html
 graphify export callflow-html ./some-repo/graphify-out
+
+graphify tree                                       # graphify-out/GRAPH_TREE.html — D3 collapsible-tree view of graph.json
+graphify tree --root ./src --max-children 200 --output docs/tree.html
+
+graphify diagnose multigraph                        # report same-endpoint edge collapse risk in graph.json
+graphify diagnose multigraph --json --max-examples 10
+
+graphify benchmark                                  # measure token reduction vs a naive full-corpus approach
+graphify benchmark graphify-out/graph.json
+
+# git merge driver for graph.json — set up by `graphify hook install`, not run by hand:
+graphify merge-driver <base> <current> <other>
 
 graphify global add graphify-out/graph.json --as myrepo   # register a project graph into ~/.graphify/global-graph.json
 graphify global remove myrepo                         # remove a project from the global graph
