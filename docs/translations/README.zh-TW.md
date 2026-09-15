@@ -160,6 +160,37 @@ graphify-out/
 
 未受支援語言中的神級節點,或是原始碼無法讀取的節點,會被標記為 `state_analysis: "skipped"` — 分類與呼叫圖評分仍會照常執行,但最終建議只會依據呼叫圖本身,而不會默默假設狀態檢查已經通過。
 
+### 從 2D 到 3D:把樓層當成一條加權的風險軸
+
+`DECOUPLE.html` 回答的是「什麼東西屬於什麼」——類別與模組的區域,以不重疊的方式打包在 graphify 自己的力導向渲染器上。但它無法呈現另一條結構軸:**每個單位距離系統的 I/O 邊界有多遠。** 一個負責讀檔的類別、一個負責處理讀到資料的類別、一個負責把結果畫出來的類別,是三種不同的工作——如果同一個類別把這三件事全包了,那是上面那些呼叫圖指標看不出來的問題,因為 `member_ratio` 和跨群組的邊,都看不出一個方法屬於處理流程的**哪個階段**。
+
+`graphify decouple --3d` 會直接把這條軸畫出來,呈現為一疊樓層平面:
+
+<p align="center">
+  <img src="../decouple-3d-demo.svg" alt="graphify decouple --3d:data_floor 計算從 I/O 邊界出發、最長的加權路徑,一個神級類別被兩個提議的群組取代,分別落在第 2 層與第 4 層" width="900">
+</p>
+
+```bash
+graphify decouple --3d               # + DECOUPLE_3D.html alongside the others
+graphify decouple --3d --project-root .
+```
+
+**第 0 層就是 I/O 邊界**(parser、loader、reader、writer、DB/HTTP client——用 graphify 其他地方相同的名稱啟發式方式偵測,`boundary_reason` 會稽核每一次呼叫)。第 *N* 層是從任何邊界節點到這個單位之間**最長**的加權有向路徑——不是最短路徑,因為一個既能靠一步捷徑抵達、也能靠 4 個階段的鏈路抵達的節點,其實是真的依賴那整條鏈路的下游。跳轉是加權計算的,不是單純計數:模組**之間**的一次呼叫算一層樓;`method` 的包含關係邊,以及模組內部的呼叫算**零層**,因為它們描述的是一個單位自己內部的組成方式,而不是處理流程的某個階段。而且關鍵是,樓層是以**類別/模組為粒度計算的,不是以函式為單位**——同一個類別底下的每個方法,依照建構方式都共享它所屬類別的樓層,因為一個函式本來就被它的類別包含,就跟 `method` 這條邊所描述的一樣。如果不這樣做,一個有 34 個方法的類別——大多數都很淺,只有少數幾個透過很少用到的 callback 深入到三個類別之外——會讓這個類別本身的身分繼承那個離群值的深度,但它的 3D 區域卻顯示出一個**不同、比較淺的**數字(取其成員的多數決)——同一個單位卻有兩個數字,而且兩個都對不上它真正的行為,也對不上畫面上實際畫出來的東西。
+
+<p align="center">
+  <img src="../decouple-3d-screenshot.png" alt="DECOUPLE_3D.html 在一次真實執行上的畫面:類別/模組區域堆疊在第 0 到第 5 層的樓層平面上,藍線代表同層連結,紅線則以斜線呈現跨樓層依賴" width="900">
+</p>
+<p align="center">
+  <em>DECOUPLE_3D.html 在一次真實執行上的畫面——每個區域都落在 2D 視圖原本安排的那個精確 (x, y) 位置上;唯一新增的是樓層(Z 軸)。可拖曳調整的「region spacing」滑桿,能即時重新打包 (x, y) 版面配置,適用於在預設間距下太密而難以閱讀的語料庫。</em>
+</p>
+
+這個以類別/模組為粒度算出來的樓層,會直接回饋到風險分數裡:`cross_floor_risk` 現在問的是**提議拆分出來的群組**之間的問題,而不是一個尚未拆分的類別自己成員之間的問題(畢竟依照建構方式,它本來就是同一個單位,不可能自己跟自己不一致)。`data_floor.hypothetical_group_floor` 會估算,如果真的把每個提議的群組抽取出來,它會落在哪一層——依據的是這個群組自己對外、真正在類別之外的邊——而 `split_risk_score` 裡的 `max_group_floor_risk`,評分的則是這些群組最後會不會落在彼此**不同**的樓層上:
+
+| 拆分前 — 一個區域、一個樓層 | 拆分後 — Preview decoupled view |
+| --- | --- |
+| <img src="../decouple-3d-before.png" alt="切換前的 DECOUPLE_3D.html:神級類別是一個實心圓盤,落在自己唯一量測出來的樓層上" width="440"> | <img src="../decouple-3d-after.png" alt="切換後的 DECOUPLE_3D.html:同一個圓盤被換成好幾個較小、虛線圓環的提議群組圓盤,分散在鄰近的幾個樓層上" width="440"> |
+| 一個類別、一個共用的樓層——因為函式是被它的類別包含的,所以每個方法自己的位置都會收斂成同一個數字。 | 提議的群組,每一個都有自己**獨立**假設出來的樓層。如果一次拆分讓各個群組分散到不同樓層,就會被標記出一個真實、非零的 `max_group_floor_risk`——這是單靠呼叫圖看不出來的風險,現在你也能親眼看到了。 |
+
 ---
 
 ## 這個工具能做什麼
@@ -950,7 +981,28 @@ uv run pytest tests/test_extract.py -q # one module
 uv run pytest tests/ -q -k "python"    # filter by name
 ```
 
+### CI 對齊檢查
+
+具權威性的 CI 指令都放在 [`.github/workflows/`](../../.github/workflows/) 裡。
+如果要在本機做出與 CI 一致的驗證,請使用 Python 3.10 或 3.12,並執行:
+
+```bash
+uv sync --all-extras --frozen
+uv run --frozen pytest tests/ -q --tb=short
+uv run --frozen python -m tools.skillgen --check
+uv run --frozen python -m tools.skillgen --audit-coverage
+uv run --frozen python -m tools.skillgen --schema-singleton
+uv run --frozen python -m tools.skillgen --monolith-roundtrip
+uv run --frozen python -m tools.skillgen --always-on-roundtrip
+uv run --frozen graphify --help
+uv run --frozen graphify install
+```
+
+Ruff 是額外有用的本機檢查工具(`uv run --frozen ruff check .`),但目前還不是會擋下 CI 的必要檢查項目。Pyright 目前也只是本機/僅供參考的檢查,除非之後把它加進 CI。Bandit 與 pip-audit 這兩個 CI 步驟目前都設定了 `continue-on-error`,所以它們的檢查結果只是參考,不會擋下 CI。
+
 > macOS 注意事項:測試套件裡同時有 `sample.f90` 和 `sample.F90` 這兩個 fixture。它們在不區分大小寫的 HFS+ / APFS 檔案系統上會互相衝突。如果你需要同時測試這兩種 Fortran 變體,請在 Linux 或 Docker 容器裡執行。
+
+> Windows 注意事項:原生 Windows 測試套件會測試符號連結(symbolic link)、長路徑、POSIX 權限、路徑分隔符號,以及 UTF-8 檔案系統行為。請啟用 Windows 開發人員模式,以允許非特權使用者建立符號連結,或是改用具管理員權限的 shell 執行測試。如果要仰賴長路徑測試,請先啟用 Windows 的 `LongPathsEnabled` 原則。變更任一項設定後,請重新啟動受影響的 shell 或應用程式。若要和會擋下 CI 的 GitHub Actions 測試矩陣完全一致,請在 WSL 或 Linux 中執行整個測試套件;CI 目前是在 Ubuntu 上,以 Python 3.10 與 3.12 執行。Pyright 目前可作為本機的參考性檢查,但還不是會擋下 CI 的必要檢查項目。
 
 ### Git 工作流程
 
@@ -968,3 +1020,16 @@ uv run pytest tests/ -q -k "python"    # filter by name
 詳見 [ARCHITECTURE.md](../../ARCHITECTURE.md) 了解模組職責與如何新增一種語言。
 
 </details>
+
+---
+
+## 社群與連結
+
+<p align="center">
+  <a href="https://graphify.com"><img src="https://img.shields.io/badge/Website-graphify.com-4c1?style=flat&logo=googlechrome&logoColor=white" alt="Website"/></a>
+  <a href="https://discord.gg/598Ad9zQZ"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord"/></a>
+  <a href="https://x.com/graphify"><img src="https://img.shields.io/badge/X-graphify-000000?logo=x&logoColor=white" alt="X"/></a>
+  <a href="https://www.youtube.com/@graphifylabs"><img src="https://img.shields.io/badge/YouTube-Graphify%20Labs-FF0000?style=flat&logo=youtube&logoColor=white" alt="YouTube"/></a>
+  <a href="https://github.com/sponsors/safishamsi"><img src="https://img.shields.io/badge/sponsor-safishamsi-ea4aaa?logo=github-sponsors" alt="Sponsor"/></a>
+  <a href="https://safishamsi.gumroad.com/l/qetvlo"><img src="https://img.shields.io/badge/Book-The%20Memory%20Layer-2ea44f?style=flat&logo=gitbook&logoColor=white" alt="The Memory Layer"/></a>
+</p>
